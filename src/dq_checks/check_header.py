@@ -17,7 +17,7 @@ def check_duplicated_column_in_csv(file_path: str, table_name: str, duckdb_conn 
     Returns:
         CheckResult: Result of the check, indicating whether the CSV header has duplicated columns.
     """
-    csv_header = get_csv_header(file_path)
+    csv_header = get_csv_header(file_path, duckdb_conn=duckdb_conn)
     if len(csv_header) > len(set(csv_header)):
         duplicated_columns = [item for item, count in Counter(csv_header).items() if count > 1]
         result = CheckResult(
@@ -55,7 +55,7 @@ def check_extra_column_in_csv(file_path: str, data_model: DataModel, table_name:
     Returns:
         CheckResult: Result of the check, indicating whether the CSV header has extra columns.
     """
-    csv_header = get_csv_header(file_path)
+    csv_header = get_csv_header(file_path, duckdb_conn=duckdb_conn)
     cdm_columns = data_model.all_column_names_in_table(table_name)
     # check extra header in csv
     extra_csv_column = set(csv_header) - set(cdm_columns)
@@ -90,7 +90,7 @@ def check_missing_column_in_csv(file_path: str, data_model: DataModel, table_nam
     Returns:
         CheckResult: Result of the check, indicating whether the CSV header is missing any required columns.
     """
-    csv_header = get_csv_header(file_path)
+    csv_header = get_csv_header(file_path, duckdb_conn=duckdb_conn)
     cdm_columns = data_model.all_column_names_in_table(table_name)
     # check extra header in csv
     missing_csv_column = set(cdm_columns) - set(csv_header)
@@ -126,7 +126,7 @@ def check_extra_column_in_parquet(file_path: str, data_model: DataModel, table_n
     Returns:
         CheckResult: Result of the check, indicating whether the Parquet header has extra columns.
     """
-    parquet_header = get_parquet_header(file_path)
+    parquet_header = get_parquet_header(file_path, duckdb_conn=duckdb_conn)
     cdm_columns = data_model.all_column_names_in_table(table_name)
     # check extra header in parquet
     extra_parquet_column = set(parquet_header) - set(cdm_columns)
@@ -161,7 +161,7 @@ def check_missing_column_in_parquet(file_path: str, data_model: DataModel, table
     Returns:
         CheckResult: Result of the check, indicating whether the Parquet header is missing any required columns.
     """
-    parquet_header = get_parquet_header(file_path)
+    parquet_header = get_parquet_header(file_path, duckdb_conn=duckdb_conn)
     cdm_columns = data_model.all_column_names_in_table(table_name)
     # check extra header in parquet
     missing_parquet_column = set(cdm_columns) - set(parquet_header)

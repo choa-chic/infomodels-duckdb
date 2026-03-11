@@ -7,7 +7,7 @@ import fnmatch
 import duckdb
 
 
-def get_csv_header(file_path: str, **kwargs) -> List[str]:
+def get_csv_header(file_path: str, duckdb_conn = None, **kwargs) -> List[str]:
     """
     Get header column list from a csv file.
 
@@ -20,6 +20,11 @@ def get_csv_header(file_path: str, **kwargs) -> List[str]:
     Returns:
         list[str]: A list of strings, each representing a column name. 
     """
+    if file_path.startswith('s3://'):
+        if duckdb_conn is None:
+            raise ValueError("duckdb_conn is required to read CSV headers from S3 paths.")
+        duckdb_conn.execute(f"DESCRIBE SELECT * FROM read_csv('{file_path}', header=true, auto_detect=true)")
+        return [item[0].lower() for item in duckdb_conn.fetchall()]
     with open(file_path) as csvfile:
         reader = csv.reader(csvfile, kwargs)
         header = next(reader, None)
@@ -28,7 +33,7 @@ def get_csv_header(file_path: str, **kwargs) -> List[str]:
         else:
             return([x.lower() for x in header])
 
-def get_parquet_header(file_path: str) -> List[str]:
+def get_parquet_header(file_path: str, duckdb_conn = None) -> List[str]:
     """
     Get header column list from a parquet file.
 
@@ -37,6 +42,13 @@ def get_parquet_header(file_path: str) -> List[str]:
     Returns:
         list[str]: A list of strings, each representing a column name. 
     """
+    if file_path.startswith('s3://'):
+        if duckdb_conn is None:
+            raise ValueError("duckdb_conn is required to read Parquet headers from S3 paths.")
+        duckdb_conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{file_path}')")
+        header = [item[0].lower() for item in duckdb_conn.fetchall()]
+        LOGGER.debug(f"Parquet file: {file_path} has columns: {header}")
+        return header
     with duckdb.connect(database=':memory:') as con:
         con.execute(f"DESCRIBE SELECT * FROM read_parquet('{file_path}')")
         header = [item[0].lower() for item in con.fetchall()]

@@ -13,6 +13,34 @@ import os
 import fnmatch
 from datetime import datetime
 
+
+def _normalize_s3_base(bucket_name: str, bucket_path: str) -> str:
+    base = f"s3://{bucket_name}"
+    path_norm = (bucket_path or '').strip('/')
+    if path_norm:
+        base = f"{base}/{path_norm}"
+    return base
+
+
+def _configure_duckdb_s3(con, s3_key: str, s3_secret: str):
+    con.execute("INSTALL httpfs;")
+    con.execute("LOAD httpfs;")
+    con.execute("SET s3_access_key_id = ?", [s3_key])
+    con.execute("SET s3_secret_access_key = ?", [s3_secret])
+
+
+def _submission_file_exists(con, file_path: str, storage_type: str, file_format: str, multiple_file_per_table: bool) -> bool:
+    if storage_type == 'local':
+        if file_format == 'csv' and not multiple_file_per_table:
+            return os.path.isfile(file_path)
+        return os.path.exists(file_path)
+    if multiple_file_per_table:
+        pattern = f"{file_path}/*.{file_format}"
+    else:
+        pattern = file_path
+    match_count = con.execute("SELECT COUNT(*) FROM glob(?);", (pattern,)).fetchone()[0]
+    return match_count > 0
+
 class _Context():
     '''An explicit context class to hold dynamic state variables during the DQ run.'''
     def __init__(
@@ -41,6 +69,18 @@ def main():
         if CONFIG['duckdb'].get('memory_limit', None):
             con.execute(f"SET memory_limit='{CONFIG['duckdb']['memory_limit']}'")
         con.execute("SET preserve_insertion_order=false")
+        submission_config = CONFIG.get('submission_files', {})
+        storage_type = submission_config.get('storage_type', 'local')
+        bucket_name = submission_config.get('BUCKET_NAME') or os.getenv('BUCKET_NAME')
+        bucket_path = submission_config.get('BUCKET_PATH') or os.getenv('BUCKET_PATH')
+        s3_key = submission_config.get('S3_KEY') or os.getenv('S3_KEY')
+        s3_secret = submission_config.get('S3_SECRET') or os.getenv('S3_SECRET')
+        if storage_type == 's3':
+            if not bucket_name:
+                raise ValueError("submission_files.BUCKET_NAME is required when storage_type is 's3'.")
+            if not s3_key or not s3_secret:
+                raise ValueError("submission_files.S3_KEY and submission_files.S3_SECRET are required when storage_type is 's3'.")
+            _configure_duckdb_s3(con, s3_key=s3_key, s3_secret=s3_secret)
         init_duckdb_logging_schema(con, run_id, CONFIG)
         LOGGER.info(f"Run ID: {run_id}.\nRunning with config: " + str(CONFIG))  
         # get data models
@@ -62,6 +102,8 @@ def main():
 
         # check submission files completeness
         submission_dir = CONFIG['submission_files']['dir']
+        if storage_type == 's3':
+            submission_dir = _normalize_s3_base(bucket_name=bucket_name, bucket_path=bucket_path)
         submission_file_format = CONFIG['submission_files'].get('file_format', 'csv')
         if_multiple_file_per_table = CONFIG['submission_files'].get('multiple_file_per_table', False)
 
@@ -72,6 +114,9 @@ def main():
             cdm_tables_expected = required_cdm_tables,
             file_format = submission_file_format,
             multiple_file_per_table = if_multiple_file_per_table,
+            storage_type = storage_type,
+            bucket_name = bucket_name,
+            bucket_path = bucket_path,
             duckdb_conn = con
         )
         if check_result_missing_submission_file.status not in ('PASS', 'SKIPPED'):
@@ -85,6 +130,9 @@ def main():
             cdm_tables_expected = data_model.all_table_names(),
             file_format = submission_file_format,
             multiple_file_per_table = if_multiple_file_per_table,
+            storage_type = storage_type,
+            bucket_name = bucket_name,
+            bucket_path = bucket_path,
             duckdb_conn = con
         )
 
@@ -100,13 +148,13 @@ def main():
             for table_name in data_model.all_table_names():
                 # check if file exists for the table
                 file_path = f"{submission_dir}/{table_name}{submission_file_extension}"
-                if not os.path.isfile(file_path):
+                if not _submission_file_exists(con, file_path, storage_type, submission_file_format, if_multiple_file_per_table):
                     LOGGER.debug(f"No submission file found for table {table_name}. Skipping header checks. Path: {file_path}")
                     continue
                 LOGGER.debug(f"Checking header for table: {table_name}, file: {file_path}")
                 # check duplicated columns in csv
-                check_result_duplicated_column = check_duplicated_column_in_csv(file_path, table_name)
-                if check_result_duplicated_column.status != 'PASS':
+                check_result_duplicated_column = check_duplicated_column_in_csv(file_path, table_name, duckdb_conn=con)
+                if check_result_duplicated_column.status == 'FAIL':
                     # if the csv has duplicated columns, don't load the table to duckdb
                     context.skip_duckdb_load_tables.append(table_name)
                     context.skip_check_tables.append(table_name)
@@ -125,7 +173,7 @@ def main():
             for table_name in data_model.all_table_names():
                 file_path = f"{submission_dir}/{table_name}{submission_file_extension}"
                 # check if file_path exists
-                if not os.path.exists(file_path):
+                if not _submission_file_exists(con, file_path, storage_type, submission_file_format, if_multiple_file_per_table):
                     LOGGER.debug(f"No submission file found for table {table_name}. Skipping header checks. Path: {file_path}")
                     continue
                 LOGGER.debug(f"Checking header for table: {table_name}, file: {file_path}")
@@ -145,7 +193,7 @@ def main():
             # Loading csv files to DuckDB
             for table_name in data_model.all_table_names():
                 file_path = f"{submission_dir}/{table_name}{submission_file_extension}"
-                if not os.path.isfile(file_path):
+                if not _submission_file_exists(con, file_path, storage_type, submission_file_format, if_multiple_file_per_table):
                     LOGGER.debug(f"No submission file found for table {table_name}. Skipping DuckDB load. Path: {file_path}")
                     continue
                 if table_name in context.skip_duckdb_load_tables:
@@ -162,7 +210,7 @@ def main():
             for table_name in data_model.all_table_names():
                 file_path = f"{submission_dir}/{table_name}{submission_file_extension}"
                 # check if file_path exists
-                if not os.path.exists(file_path):
+                if not _submission_file_exists(con, file_path, storage_type, submission_file_format, if_multiple_file_per_table):
                     LOGGER.debug(f"No submission file found for table {table_name}. Skipping DuckDB load. Path: {file_path}")
                     continue
                 if table_name in context.skip_duckdb_load_tables:

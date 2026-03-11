@@ -8,7 +8,11 @@ from src.constants import OPTIONAL_TABLES
 def _get_table_names_from_files(
         file_dir: str,
         file_format: str,
-        multiple_file_per_table: bool
+    multiple_file_per_table: bool,
+    storage_type: str = 'local',
+    duckdb_conn = None,
+    bucket_name: str = None,
+    bucket_path: str = None,
     ) -> Set[str]:
     """
     Helper function to get table names from files in the directory.
@@ -20,6 +24,33 @@ def _get_table_names_from_files(
         Set[str]: Set of table names derived from the files in the directory.
     """
     table_names = set()
+    if storage_type == 's3':
+        if duckdb_conn is None:
+            raise ValueError("duckdb_conn is required when storage_type='s3'.")
+        if not bucket_name:
+            raise ValueError("bucket_name is required when storage_type='s3'.")
+        bucket_path_norm = (bucket_path or '').strip('/')
+        s3_base = f"s3://{bucket_name}"
+        if bucket_path_norm:
+            s3_base = f"{s3_base}/{bucket_path_norm}"
+        if file_format == 'csv':
+            file_extension = '.csv'
+        elif file_format == 'parquet':
+            file_extension = '.parquet'
+        else:
+            raise ValueError(f"Unsupported file_format: {file_format}. Supported types are 'csv' and 'parquet'.")
+
+        if not multiple_file_per_table:
+            pattern = f"{s3_base}/*{file_extension}"
+            files = [item[0] for item in duckdb_conn.execute("SELECT file FROM glob(?);", (pattern,)).fetchall()]
+            table_names = {os.path.splitext(os.path.basename(f))[0] for f in files}
+        else:
+            pattern = f"{s3_base}/*/*{file_extension}"
+            files = [item[0] for item in duckdb_conn.execute("SELECT file FROM glob(?);", (pattern,)).fetchall()]
+            table_names = {os.path.basename(os.path.dirname(f)) for f in files}
+        LOGGER.info(f"Table names found from S3 files: {table_names}")
+        return table_names
+
     if not multiple_file_per_table:
         if file_format == 'csv':
             file_extension = '.csv'
@@ -39,6 +70,9 @@ def check_missing_submission_file(
         cdm_tables_expected: Tuple[str, ...],
         file_format: str = 'csv',
         multiple_file_per_table: bool = False,
+    storage_type: str = 'local',
+    bucket_name: str = None,
+    bucket_path: str = None,
         duckdb_conn = None
     ) -> CheckResult:
     """
@@ -66,7 +100,11 @@ def check_missing_submission_file(
     table_names_from_files = _get_table_names_from_files(
         file_dir = file_dir,
         file_format = file_format,
-        multiple_file_per_table = multiple_file_per_table
+        multiple_file_per_table = multiple_file_per_table,
+        storage_type = storage_type,
+        duckdb_conn = duckdb_conn,
+        bucket_name = bucket_name,
+        bucket_path = bucket_path,
     )
     missing_tables = set(cdm_tables_expected) - set(table_names_from_files) - set(OPTIONAL_TABLES)
     if len(missing_tables) > 0:
@@ -89,6 +127,9 @@ def check_extra_submission_file(
         cdm_tables_expected: Tuple[str, ...],
         file_format: str = 'csv',
         multiple_file_per_table: bool = False,
+    storage_type: str = 'local',
+    bucket_name: str = None,
+    bucket_path: str = None,
         duckdb_conn = None
     ) -> CheckResult:
     """
@@ -117,7 +158,11 @@ def check_extra_submission_file(
     filenames_from_tables = _get_table_names_from_files(
         file_dir = file_dir,
         file_format = file_format,
-        multiple_file_per_table = multiple_file_per_table
+        multiple_file_per_table = multiple_file_per_table,
+        storage_type = storage_type,
+        duckdb_conn = duckdb_conn,
+        bucket_name = bucket_name,
+        bucket_path = bucket_path,
     )
     extra_files = set(filenames_from_tables) - set(filenames_from_tables)
     if len(extra_files) > 0:

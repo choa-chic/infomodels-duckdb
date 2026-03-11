@@ -72,6 +72,26 @@ It provides utilities to validate data integrity rules, such as constraints and 
     python -m src.main
     ```
 
+## Running From AWS S3
+
+You can run validation against CSV or Parquet files stored in S3 by setting these options in `config.yml`:
+
+```yaml
+submission_files:
+    storage_type: s3
+    BUCKET_NAME: your-bucket
+    BUCKET_PATH: path/inside/bucket
+    S3_KEY: YOUR_AWS_ACCESS_KEY_ID
+    S3_SECRET: YOUR_AWS_SECRET_ACCESS_KEY
+    file_format: csv        # or parquet
+    multiple_file_per_table: false
+```
+
+Notes:
+- `BUCKET_PATH` is optional; leave empty to use bucket root.
+- `dir` is ignored when `storage_type: s3`.
+- For local mode, keep `storage_type: local` and use `submission_files.dir`.
+
 ## Implemented Checks
 
 The following data quality checks are currently supported:

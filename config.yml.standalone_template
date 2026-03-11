@@ -5,6 +5,11 @@ data-models:
 
 submission_files:
   dir: /PATH/TO/DIR/WITH/CSV/FILES
+  storage_type: local  # local or s3
+  BUCKET_NAME: ""     # required when storage_type=s3
+  BUCKET_PATH: ""     # required when storage_type=s3 (prefix inside bucket)
+  S3_KEY: ""          # required when storage_type=s3
+  S3_SECRET: ""       # required when storage_type=s3
   file_format: csv  # file_type can be 'csv' or 'parquet'
   multiple_file_per_table: false  # Set to false if each table is a single file named {table_name}.csv or {table_name}.parquet. Set to true if each table can have multiple files in a folder named after the table. Currently only support parquet
 

@@ -79,18 +79,31 @@ You can run validation against CSV or Parquet files stored in S3 by setting thes
 ```yaml
 submission_files:
     storage_type: s3
+    access_mode: pointer
     BUCKET_NAME: your-bucket
     BUCKET_PATH: path/inside/bucket
-    S3_KEY: YOUR_AWS_ACCESS_KEY_ID
-    S3_SECRET: YOUR_AWS_SECRET_ACCESS_KEY
+    allow_config_s3_credentials: false
     file_format: csv        # or parquet
     multiple_file_per_table: false
 ```
+
+Set credentials with environment variables (recommended):
+
+```bash
+export S3_KEY=YOUR_AWS_ACCESS_KEY_ID
+export S3_SECRET=YOUR_AWS_SECRET_ACCESS_KEY
+```
+
+If needed, you can still store credentials in `config.yml` by setting `allow_config_s3_credentials: true`.
 
 Notes:
 - `BUCKET_PATH` is optional; leave empty to use bucket root.
 - `dir` is ignored when `storage_type: s3`.
 - For local mode, keep `storage_type: local` and use `submission_files.dir`.
+- S3 discovery is recursive under `BUCKET_PATH` (`**/*.{csv|parquet}`).
+- Files are matched to CDM tables by filename prefix (case-insensitive), so names like `DRUG_EXPOSURE.parquet_1_5_12.snappy.parquet` are grouped under `drug_exposure`.
+- If multiple matching files are found for a table, all are loaded.
+- `access_mode: pointer` creates DuckDB views over source files (no row copy). `access_mode: copy` materializes rows into local DuckDB tables.
 
 ## Implemented Checks
 

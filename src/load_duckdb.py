@@ -5,6 +5,38 @@ from duckdb import DuckDBPyConnection
 import duckdb
 from src.data_model import DataModel
 
+
+def _escape_sql_string(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def create_pointer_view_from_files(
+    con: DuckDBPyConnection,
+    table_name: str,
+    source_files: list[str] | tuple[str, ...] | str,
+    file_format: str,
+):
+    if isinstance(source_files, str):
+        source_files = [source_files]
+    if len(source_files) == 0:
+        raise ValueError(f"No source files provided for pointer view: {table_name}")
+
+    union_selects = []
+    for source_path in source_files:
+        source_path_sql = _escape_sql_string(source_path)
+        if file_format == 'parquet':
+            union_selects.append(f"SELECT * FROM read_parquet('{source_path_sql}')")
+        elif file_format == 'csv':
+            union_selects.append(f"SELECT * FROM read_csv('{source_path_sql}', header=true, auto_detect=true)")
+        else:
+            raise ValueError(f"Unsupported file_format for pointer mode: {file_format}")
+
+    union_sql = "\nUNION ALL\n".join(union_selects)
+    con.execute(f'DROP TABLE IF EXISTS "{table_name}";')
+    con.execute(f'DROP VIEW IF EXISTS "{table_name}";')
+    con.execute(f'CREATE VIEW "{table_name}" AS {union_sql};')
+    LOGGER.info(f"Created pointer view for {table_name} from {len(source_files)} source file(s).")
+
 def init_duckdb_logging_schema(con: DuckDBPyConnection, run_id: str, run_config: dict, logging_schema = 'logging') -> DuckDBPyConnection:
     con.execute(f"""
     CREATE SCHEMA IF NOT EXISTS {logging_schema};
@@ -52,7 +84,7 @@ def create_duckdb_tables(data_model: DataModel, con: DuckDBPyConnection, skip_ta
     return con
 
 
-def load_csv_to_duckdb(csv_path: str, con: DuckDBPyConnection, table_name: str, accept_additional_col: bool = True):
+def load_csv_to_duckdb(csv_path: str | list[str] | tuple[str, ...], con: DuckDBPyConnection, table_name: str, accept_additional_col: bool = True):
     """
     Loads a CSV file into a DuckDB table. Any additional column in csv will be added to database
 
@@ -65,7 +97,8 @@ def load_csv_to_duckdb(csv_path: str, con: DuckDBPyConnection, table_name: str, 
     Returns:
     - duckdb.Connection object connected to the database.
     """
-    csv_header = [item.lower() for item in get_csv_header(csv_path)]
+    csv_sources = list(csv_path) if isinstance(csv_path, (list, tuple)) else [csv_path]
+    csv_header = [item.lower() for item in get_csv_header(csv_sources, duckdb_conn=con)]
     duckdb_columns = con.execute(f'DESCRIBE {table_name}').df()['column_name'].tolist()
     # if csv has more columns than duckdb
     if (set(csv_header) - set(duckdb_columns)):
@@ -76,19 +109,20 @@ def load_csv_to_duckdb(csv_path: str, con: DuckDBPyConnection, table_name: str, 
         else:
             raise ValueError(f"CSV file has additional columns {set(csv_header) - set(duckdb_columns)} not in duckdb table {table_name} and accept_additional_col is set to False.")
     count_before_load = get_table_count(con, table_name)
-    LOGGER.info(f"Loading {csv_path} to {table_name}...")
-    copy_sql = f"""COPY {table_name} ({', '.join(csv_header)}) FROM '{csv_path}' ({CONFIG['duckdb']['copy_options'] + ', AUTO_DETECT false'});"""
-    LOGGER.debug(f"Executing SQL: {copy_sql}")
-    try:
-        con.execute(copy_sql)
-    except Exception as e:
-        LOGGER.error(f"Fail to load CSV to DuckDB: table={table_name}, csv={csv_path}")
-        raise
+    LOGGER.info(f"Loading {len(csv_sources)} csv file(s) to {table_name}...")
+    for source_path in csv_sources:
+        copy_sql = f"""COPY {table_name} ({', '.join(csv_header)}) FROM '{source_path}' ({CONFIG['duckdb']['copy_options'] + ', AUTO_DETECT false'});"""
+        LOGGER.debug(f"Executing SQL: {copy_sql}")
+        try:
+            con.execute(copy_sql)
+        except Exception:
+            LOGGER.error(f"Fail to load CSV to DuckDB: table={table_name}, csv={source_path}")
+            raise
     count_after_load = get_table_count(con, table_name)
     LOGGER.info(f"Loaded {count_after_load - count_before_load} rows into {table_name}.")
     return con
 
-def load_parquet_to_duckdb(parquet_path: str, con: DuckDBPyConnection, table_name: str, accept_additional_col: bool = True):
+def load_parquet_to_duckdb(parquet_path: str | list[str] | tuple[str, ...], con: DuckDBPyConnection, table_name: str, accept_additional_col: bool = True):
     """
     Loads a Parquet file into a DuckDB table. Any additional column in parquet will be added to database
 
@@ -101,7 +135,8 @@ def load_parquet_to_duckdb(parquet_path: str, con: DuckDBPyConnection, table_nam
     Returns:
     - duckdb.Connection object connected to the database.
     """
-    parquet_header = [item.lower() for item in get_parquet_header(parquet_path)]
+    parquet_sources = list(parquet_path) if isinstance(parquet_path, (list, tuple)) else [parquet_path]
+    parquet_header = [item.lower() for item in get_parquet_header(parquet_sources, duckdb_conn=con)]
     duckdb_columns = con.execute(f'DESCRIBE {table_name}').df()['column_name'].tolist()
     # if parquet has more columns than duckdb
     if (set(parquet_header) - set(duckdb_columns)):
@@ -112,14 +147,15 @@ def load_parquet_to_duckdb(parquet_path: str, con: DuckDBPyConnection, table_nam
         else:
             raise ValueError(f"Parquet file has additional columns {set(parquet_header) - set(duckdb_columns)} not in duckdb table {table_name} and accept_additional_col is set to False.")
     count_before_load = get_table_count(con, table_name)
-    LOGGER.info(f"Loading {parquet_path} to {table_name}...")
-    copy_sql = f"""COPY {table_name} ({', '.join(parquet_header)}) FROM '{parquet_path}' ({CONFIG['duckdb']['copy_options']});"""
-    LOGGER.debug(f"Executing SQL: {copy_sql}")
-    try:
-        con.execute(copy_sql)
-    except Exception as e:
-        LOGGER.error(f"Fail to load Parquet to DuckDB: table={table_name}, parquet={parquet_path}")
-        raise
+    LOGGER.info(f"Loading {len(parquet_sources)} parquet file(s) to {table_name}...")
+    for source_path in parquet_sources:
+        copy_sql = f"""COPY {table_name} ({', '.join(parquet_header)}) FROM '{source_path}' ({CONFIG['duckdb']['copy_options']});"""
+        LOGGER.debug(f"Executing SQL: {copy_sql}")
+        try:
+            con.execute(copy_sql)
+        except Exception:
+            LOGGER.error(f"Fail to load Parquet to DuckDB: table={table_name}, parquet={source_path}")
+            raise
     count_after_load = get_table_count(con, table_name)
     LOGGER.info(f"Loaded {count_after_load - count_before_load} rows into {table_name}.")
     return con

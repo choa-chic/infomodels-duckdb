@@ -1,6 +1,6 @@
 from src.config import CONFIG, LOGGER
 from src.dq_checks.check_result import CheckResult
-from src.load_duckdb import create_duckdb_tables, load_csv_to_duckdb, init_duckdb_logging_schema, load_parquet_to_duckdb
+from src.load_duckdb import create_duckdb_tables, load_csv_to_duckdb, init_duckdb_logging_schema, load_parquet_to_duckdb, create_pointer_view_from_files
 from src.data_model import DataModel
 from src.constants import OPTIONAL_TABLES
 from src.dq_checks.check_file_completeness import check_missing_submission_file, check_extra_submission_file
@@ -15,6 +15,12 @@ from datetime import datetime
 
 
 def _normalize_s3_base(bucket_name: str, bucket_path: str) -> str:
+    if '/' in bucket_name:
+        bucket_name_parts = bucket_name.split('/', 1)
+        bucket_name = bucket_name_parts[0]
+        extra_path = bucket_name_parts[1].strip('/')
+        if extra_path:
+            bucket_path = f"{extra_path}/{(bucket_path or '').strip('/')}".strip('/')
     base = f"s3://{bucket_name}"
     path_norm = (bucket_path or '').strip('/')
     if path_norm:
@@ -27,6 +33,63 @@ def _configure_duckdb_s3(con, s3_key: str, s3_secret: str):
     con.execute("LOAD httpfs;")
     con.execute("SET s3_access_key_id = ?", [s3_key])
     con.execute("SET s3_secret_access_key = ?", [s3_secret])
+
+
+def _extract_table_prefix_from_filename(filename: str, file_format: str) -> str:
+    return filename.split('.', 1)[0]
+
+
+def _allowed_suffixes(file_format: str) -> tuple[str, ...]:
+    if file_format == 'csv':
+        return ('.csv',)
+    if file_format in ('parquet', 'pq'):
+        return ('.parquet', '.pq')
+    raise ValueError(f"Unsupported submission file format: {file_format}. Supported formats are 'csv', 'parquet', and 'pq'.")
+
+
+def _extract_table_name_from_path(file_path: str, file_format: str) -> str:
+    table_name = _extract_table_prefix_from_filename(os.path.basename(file_path), file_format)
+    if table_name.startswith(f'.{file_format}_') or table_name == '':
+        parent_name = os.path.basename(os.path.dirname(file_path))
+        table_name = _extract_table_prefix_from_filename(parent_name, file_format)
+    return table_name
+
+
+def _canonicalize_table_name(candidate_name: str, expected_tables_lower: set[str]) -> str:
+    candidate_lower = candidate_name.lower()
+    if candidate_lower in expected_tables_lower:
+        return candidate_lower
+    for expected_name in sorted(expected_tables_lower, key=len, reverse=True):
+        if candidate_lower.startswith(expected_name + '_'):
+            return expected_name
+    return candidate_lower
+
+
+def _glob_s3_files(con, s3_base: str, file_format: str, max_depth: int = 6) -> list[str]:
+    files: set[str] = set()
+    for suffix in _allowed_suffixes(file_format):
+        for depth in range(0, max_depth + 1):
+            wildcard = "*/" * depth
+            pattern = f"{s3_base}/{wildcard}*{suffix}"
+            matches = [item[0] for item in con.execute("SELECT file FROM glob(?);", (pattern,)).fetchall()]
+            files.update(matches)
+    return sorted(files)
+
+
+def _discover_s3_files_by_table(con, s3_base: str, file_format: str, expected_tables: list[str] | tuple[str, ...]) -> dict[str, list[str]]:
+    all_files = _glob_s3_files(con, s3_base=s3_base.rstrip('/'), file_format=file_format)
+    output: dict[str, list[str]] = {}
+    expected_tables_lower = {item.lower() for item in expected_tables}
+    for file_path in all_files:
+        table_prefix_raw = _extract_table_name_from_path(file_path, file_format)
+        table_prefix = _canonicalize_table_name(table_prefix_raw, expected_tables_lower)
+        output.setdefault(table_prefix, []).append(file_path)
+    if len(all_files) == 0:
+        LOGGER.warning(
+            f"No S3 files discovered under prefix '{s3_base}' with extension '.{file_format}'. "
+            "Check BUCKET_NAME/BUCKET_PATH and exact case (S3 is case-sensitive)."
+        )
+    return output
 
 
 def _submission_file_exists(con, file_path: str, storage_type: str, file_format: str, multiple_file_per_table: bool) -> bool:
@@ -73,13 +136,20 @@ def main():
         storage_type = submission_config.get('storage_type', 'local')
         bucket_name = submission_config.get('BUCKET_NAME') or os.getenv('BUCKET_NAME')
         bucket_path = submission_config.get('BUCKET_PATH') or os.getenv('BUCKET_PATH')
-        s3_key = submission_config.get('S3_KEY') or os.getenv('S3_KEY')
-        s3_secret = submission_config.get('S3_SECRET') or os.getenv('S3_SECRET')
+        allow_config_s3_credentials = submission_config.get('allow_config_s3_credentials', False)
+        s3_key = os.getenv('S3_KEY')
+        s3_secret = os.getenv('S3_SECRET')
+        if not s3_key and allow_config_s3_credentials:
+            s3_key = submission_config.get('S3_KEY')
+        if not s3_secret and allow_config_s3_credentials:
+            s3_secret = submission_config.get('S3_SECRET')
+        if storage_type == 's3' and (submission_config.get('S3_KEY') or submission_config.get('S3_SECRET')) and not allow_config_s3_credentials:
+            LOGGER.warning("S3_KEY/S3_SECRET in config.yml are ignored by default. Set env vars S3_KEY and S3_SECRET, or set submission_files.allow_config_s3_credentials=true to opt in.")
         if storage_type == 's3':
             if not bucket_name:
                 raise ValueError("submission_files.BUCKET_NAME is required when storage_type is 's3'.")
             if not s3_key or not s3_secret:
-                raise ValueError("submission_files.S3_KEY and submission_files.S3_SECRET are required when storage_type is 's3'.")
+                raise ValueError("S3 credentials are required when storage_type is 's3'. Set env vars S3_KEY and S3_SECRET, or set submission_files.allow_config_s3_credentials=true and provide submission_files.S3_KEY/S3_SECRET.")
             _configure_duckdb_s3(con, s3_key=s3_key, s3_secret=s3_secret)
         init_duckdb_logging_schema(con, run_id, CONFIG)
         LOGGER.info(f"Run ID: {run_id}.\nRunning with config: " + str(CONFIG))  
@@ -101,11 +171,24 @@ def main():
         LOGGER.info("DuckDB tables created successfully.")
 
         # check submission files completeness
-        submission_dir = CONFIG['submission_files']['dir']
+        submission_dir = submission_config.get('dir')
         if storage_type == 's3':
             submission_dir = _normalize_s3_base(bucket_name=bucket_name, bucket_path=bucket_path)
+        elif not submission_dir:
+            raise ValueError("submission_files.dir is required when storage_type is 'local'.")
         submission_file_format = CONFIG['submission_files'].get('file_format', 'csv')
         if_multiple_file_per_table = CONFIG['submission_files'].get('multiple_file_per_table', False)
+        access_mode = CONFIG['submission_files'].get('access_mode', 'copy')
+        if access_mode not in ('copy', 'pointer'):
+            raise ValueError("Unsupported submission_files.access_mode. Supported values are 'copy' and 'pointer'.")
+        s3_files_by_table = {}
+        if storage_type == 's3':
+            s3_files_by_table = _discover_s3_files_by_table(
+                con,
+                submission_dir,
+                submission_file_format,
+                data_model.all_table_names()
+            )
 
         LOGGER.debug("Checking submission files completeness.")
         required_cdm_tables = tuple(set(data_model.all_table_names()) - set(OPTIONAL_TABLES) - set(context.skip_duckdb_load_tables))
@@ -137,8 +220,8 @@ def main():
         )
 
         # Check header issues
-        if submission_file_format not in ('csv', 'parquet'):
-            raise ValueError(f"Unsupported submission file format: {submission_file_format}. Supported formats are 'csv' and 'parquet'.")
+        if submission_file_format not in ('csv', 'parquet', 'pq'):
+            raise ValueError(f"Unsupported submission file format: {submission_file_format}. Supported formats are 'csv', 'parquet', and 'pq'.")
         # TODO: implement csv header checks for multiple files per table later
         if submission_file_format == 'csv' and if_multiple_file_per_table:
             raise NotImplementedError("Header checks for multiple files per table in CSV format are not implemented yet. For now, please merge your csv files into single file.")
@@ -146,11 +229,17 @@ def main():
             submission_file_extension = '.csv'
             # check header issues
             for table_name in data_model.all_table_names():
-                # check if file exists for the table
-                file_path = f"{submission_dir}/{table_name}{submission_file_extension}"
-                if not _submission_file_exists(con, file_path, storage_type, submission_file_format, if_multiple_file_per_table):
-                    LOGGER.debug(f"No submission file found for table {table_name}. Skipping header checks. Path: {file_path}")
-                    continue
+                if storage_type == 's3':
+                    table_sources = s3_files_by_table.get(table_name.lower(), [])
+                    if len(table_sources) == 0:
+                        LOGGER.debug(f"No submission file found for table {table_name}. Skipping header checks.")
+                        continue
+                    file_path = table_sources[0]
+                else:
+                    file_path = f"{submission_dir}/{table_name}{submission_file_extension}"
+                    if not _submission_file_exists(con, file_path, storage_type, submission_file_format, if_multiple_file_per_table):
+                        LOGGER.debug(f"No submission file found for table {table_name}. Skipping header checks. Path: {file_path}")
+                        continue
                 LOGGER.debug(f"Checking header for table: {table_name}, file: {file_path}")
                 # check duplicated columns in csv
                 check_result_duplicated_column = check_duplicated_column_in_csv(file_path, table_name, duckdb_conn=con)
@@ -164,18 +253,24 @@ def main():
                 check_result_missing_column = check_missing_column_in_csv(file_path, data_model, table_name, duckdb_conn=con)
                 if check_result_missing_column.status != 'PASS':
                     context.skip_check_columns[table_name] = context.skip_check_columns.get(table_name, tuple()) + check_result_missing_column.column_name
-        if submission_file_format == 'parquet':
+        if submission_file_format in ('parquet', 'pq'):
             if if_multiple_file_per_table:
                 submission_file_extension = ''
             else:
                 submission_file_extension = '.parquet'
             # check header issues
             for table_name in data_model.all_table_names():
-                file_path = f"{submission_dir}/{table_name}{submission_file_extension}"
-                # check if file_path exists
-                if not _submission_file_exists(con, file_path, storage_type, submission_file_format, if_multiple_file_per_table):
-                    LOGGER.debug(f"No submission file found for table {table_name}. Skipping header checks. Path: {file_path}")
-                    continue
+                if storage_type == 's3':
+                    table_sources = s3_files_by_table.get(table_name.lower(), [])
+                    if len(table_sources) == 0:
+                        LOGGER.debug(f"No submission file found for table {table_name}. Skipping header checks.")
+                        continue
+                    file_path = table_sources[0]
+                else:
+                    file_path = f"{submission_dir}/{table_name}{submission_file_extension}"
+                    if not _submission_file_exists(con, file_path, storage_type, submission_file_format, if_multiple_file_per_table):
+                        LOGGER.debug(f"No submission file found for table {table_name}. Skipping header checks. Path: {file_path}")
+                        continue
                 LOGGER.debug(f"Checking header for table: {table_name}, file: {file_path}")
                 # check extra columns in parquet
                 check_result_extra_column = check_extra_column_in_parquet(file_path, data_model, table_name, duckdb_conn=con)
@@ -184,7 +279,7 @@ def main():
                 if check_result_missing_column.status != 'PASS':
                     context.skip_check_columns[table_name] = context.skip_check_columns.get(table_name, tuple()) + check_result_missing_column.column_name
         # Load submission files into DuckDB
-        LOGGER.info("Loading submission files into DuckDB.")
+        LOGGER.info(f"Preparing submission data in DuckDB using access_mode={access_mode}.")
         # TODO: implement csv load for multiple files per table later
         if submission_file_format == 'csv' and if_multiple_file_per_table:
             raise NotImplementedError("Loading multiple files per table in CSV format into DuckDB is not implemented yet. Please merge your csv files into single file per table.")
@@ -192,35 +287,64 @@ def main():
             submission_file_extension = '.csv'
             # Loading csv files to DuckDB
             for table_name in data_model.all_table_names():
-                file_path = f"{submission_dir}/{table_name}{submission_file_extension}"
-                if not _submission_file_exists(con, file_path, storage_type, submission_file_format, if_multiple_file_per_table):
-                    LOGGER.debug(f"No submission file found for table {table_name}. Skipping DuckDB load. Path: {file_path}")
-                    continue
+                if storage_type == 's3':
+                    table_sources = s3_files_by_table.get(table_name.lower(), [])
+                    if len(table_sources) == 0:
+                        LOGGER.debug(f"No submission file found for table {table_name}. Skipping DuckDB load.")
+                        continue
+                    file_path = table_sources
+                else:
+                    file_path = f"{submission_dir}/{table_name}{submission_file_extension}"
+                    if not _submission_file_exists(con, file_path, storage_type, submission_file_format, if_multiple_file_per_table):
+                        LOGGER.debug(f"No submission file found for table {table_name}. Skipping DuckDB load. Path: {file_path}")
+                        continue
                 if table_name in context.skip_duckdb_load_tables:
                     LOGGER.debug(f"Skipping loading {table_name} to DuckDB as it is in the skip list.")
                     continue
-                LOGGER.info(f"Loading {file_path} into DuckDB table {table_name}.")
-                load_csv_to_duckdb(csv_path=file_path, con=con, table_name=table_name, accept_additional_col=True)
-        if submission_file_format == 'parquet':
+                if access_mode == 'pointer':
+                    if isinstance(file_path, str):
+                        pointer_sources = [file_path]
+                    else:
+                        pointer_sources = file_path
+                    LOGGER.info(f"Creating pointer view for {table_name} from {len(pointer_sources)} csv file(s).")
+                    create_pointer_view_from_files(con=con, table_name=table_name, source_files=pointer_sources, file_format='csv')
+                else:
+                    LOGGER.info(f"Loading {file_path} into DuckDB table {table_name}.")
+                    load_csv_to_duckdb(csv_path=file_path, con=con, table_name=table_name, accept_additional_col=True)
+        if submission_file_format in ('parquet', 'pq'):
             if if_multiple_file_per_table:
                 submission_file_extension = ''
             else:
                 submission_file_extension = '.parquet'
             # Loading parquet files to DuckDB
             for table_name in data_model.all_table_names():
-                file_path = f"{submission_dir}/{table_name}{submission_file_extension}"
-                # check if file_path exists
-                if not _submission_file_exists(con, file_path, storage_type, submission_file_format, if_multiple_file_per_table):
-                    LOGGER.debug(f"No submission file found for table {table_name}. Skipping DuckDB load. Path: {file_path}")
-                    continue
+                if storage_type == 's3':
+                    table_sources = s3_files_by_table.get(table_name.lower(), [])
+                    if len(table_sources) == 0:
+                        LOGGER.debug(f"No submission file found for table {table_name}. Skipping DuckDB load.")
+                        continue
+                    file_path = table_sources
+                else:
+                    file_path = f"{submission_dir}/{table_name}{submission_file_extension}"
+                    if not _submission_file_exists(con, file_path, storage_type, submission_file_format, if_multiple_file_per_table):
+                        LOGGER.debug(f"No submission file found for table {table_name}. Skipping DuckDB load. Path: {file_path}")
+                        continue
                 if table_name in context.skip_duckdb_load_tables:
                     LOGGER.debug(f"Skipping loading {table_name} to DuckDB as it is in the skip list.")
                     continue
-                LOGGER.info(f"Loading {file_path} into DuckDB table {table_name}.")
-                load_parquet_to_duckdb(parquet_path=file_path, con=con, table_name=table_name, accept_additional_col=True)
+                if access_mode == 'pointer':
+                    if isinstance(file_path, str):
+                        pointer_sources = [file_path]
+                    else:
+                        pointer_sources = file_path
+                    LOGGER.info(f"Creating pointer view for {table_name} from {len(pointer_sources)} parquet file(s).")
+                    create_pointer_view_from_files(con=con, table_name=table_name, source_files=pointer_sources, file_format='parquet')
+                else:
+                    LOGGER.info(f"Loading {file_path} into DuckDB table {table_name}.")
+                    load_parquet_to_duckdb(parquet_path=file_path, con=con, table_name=table_name, accept_additional_col=True)
 
 
-        LOGGER.info("All submission files loaded into DuckDB successfully.")
+        LOGGER.info(f"Submission data ready in DuckDB with access_mode={access_mode}.")
         
         # Check foreign key violations
         LOGGER.info("Checking foreign key violations.") 

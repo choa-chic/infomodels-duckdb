@@ -7,6 +7,7 @@ submission_files:
   dir: /PATH/TO/DIR/WITH/CSV/FILES
   file_format: csv  # file_type can be 'csv' or 'parquet'
   multiple_file_per_table: false  # Set to false if each table is a single file named {table_name}.csv or {table_name}.parquet. Set to true if each table can have multiple files in a folder named after the table. Currently only support parquet
+  access_mode: copy  # 'copy' loads rows into the duckdb file. 'pointer' creates views over the parquet files instead, so no second copy of the data lands on disk. Currently only supports parquet
 
 duckdb:
   path: /PATH/TO/STORE/SOME_FILENAME.duckdb # path to store cdm duckdb file generated

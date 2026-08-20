@@ -158,6 +158,24 @@ submission_files:
   con.execute("ATTACH 'cdm.duckdb' AS s (READ_ONLY); ATTACH 'cdm_compact.duckdb' AS d;")
   con.execute("COPY FROM DATABASE s TO d;")
   ```
+### Knowing what a run actually did
+
+Two lines are written at the start of every run so the log records what the code resolved, not what the config asked for:
+
+```
+Config loaded from /opt/infomodels/config.yml (path taken from INFOMODELS_CONFIG)
+Effective settings: config=..., submission_dir=..., file_format=parquet, multiple_file_per_table=False, access_mode=pointer, duckdb=...
+```
+
+The `Running with config:` dump prints the yaml as written, including settings the running version does not read, so it cannot tell you which mode a run used. `Effective settings` can.
+
+A setting under `submission_files` that this version does not support is reported and then ignored:
+
+```
+Ignoring submission_files setting(s) this version does not support: ['access_modes']. They have no effect on this run.
+```
+
+This catches a misspelled setting, and a config written for a newer build than the one being run -- both of which otherwise load, appear in the config dump, and are silently ignored.
 
 ## Implemented Checks
 

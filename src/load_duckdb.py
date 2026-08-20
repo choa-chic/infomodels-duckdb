@@ -1,4 +1,6 @@
 from typing import List
+import os
+import shutil
 from src.util import get_csv_header, get_table_count, get_parquet_header, table_exists
 from src.config import CONFIG, LOGGER
 from duckdb import DuckDBPyConnection
@@ -15,6 +17,17 @@ def _quote_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def get_relation_type(con: DuckDBPyConnection, table_name: str):
+    """
+    Return 'VIEW', 'BASE TABLE' or None for a relation, so callers can branch on its type.
+    """
+    row = con.execute(
+        "SELECT table_type FROM information_schema.tables WHERE lower(table_name) = lower(?)",
+        (table_name,)
+    ).fetchone()
+    return None if row is None else row[0]
+
+
 def drop_relation_if_exists(con: DuckDBPyConnection, table_name: str):
     """
     Drop a CDM relation whatever its type, so copy and pointer runs can alternate.
@@ -22,13 +35,10 @@ def drop_relation_if_exists(con: DuckDBPyConnection, table_name: str):
     DROP TABLE IF EXISTS raises on a view and DROP VIEW IF EXISTS raises on a table,
     so a run that re-uses an existing duckdb file has to look the type up first.
     """
-    relation_type = con.execute(
-        "SELECT table_type FROM information_schema.tables WHERE lower(table_name) = lower(?)",
-        (table_name,)
-    ).fetchone()
+    relation_type = get_relation_type(con, table_name)
     if relation_type is None:
         return
-    if relation_type[0] == 'VIEW':
+    if relation_type == 'VIEW':
         con.execute(f'DROP VIEW IF EXISTS {_quote_ident(table_name)};')
     else:
         con.execute(f'DROP TABLE IF EXISTS {_quote_ident(table_name)};')
@@ -132,6 +142,80 @@ def create_parquet_pointer_view(
         raise
     LOGGER.info(f"Pointed {table_name} at {len(parquet_header)} column(s) of parquet, {get_table_count(con, table_name)} rows visible.")
     return con
+
+
+def materialize_pointer_view(con: DuckDBPyConnection, table_name: str, data_model: DataModel) -> int:
+    """
+    Replace a pointer view with a real table holding the same rows.
+
+    Pointer mode leaves the rows in the parquet, which is what makes the checks cheap,
+    but a submission has to be a single duckdb file that carries its own data. The view
+    is already cast to the data model's declared types, so selecting from it in the data
+    model's column order reproduces the table copy mode would have built, column for
+    column. Columns the parquet added are appended as copy mode appends them.
+
+    The swap is staged: the new table is built and its row count verified before the view
+    is dropped, so a failure part way through leaves the view intact.
+
+    Parameters:
+    - con: DuckDBPyConnection, a duckdb connection.
+    - data_model: DataModel, the authority on column order for this table.
+    - table_name: str, the name of the CDM relation to materialize.
+
+    Returns:
+    - int, the number of rows materialized.
+    """
+    relation_type = get_relation_type(con, table_name)
+    if relation_type is None:
+        raise ValueError(f"No relation named {table_name} to materialize.")
+    if relation_type != 'VIEW':
+        # already a table -- a copy-mode run, or a re-run over an already materialized file
+        LOGGER.debug(f"{table_name} is already a {relation_type}, nothing to materialize.")
+        return get_table_count(con, table_name)
+
+    view_columns = [row[0] for row in con.execute(f'DESCRIBE {_quote_ident(table_name)}').fetchall()]
+    model_columns = [col for col in data_model.all_column_names_in_table(table_name) if col in view_columns]
+    extra_columns = [col for col in view_columns if col not in model_columns]
+    ordered_columns = model_columns + extra_columns
+    select_list = ', '.join(_quote_ident(col) for col in ordered_columns)
+
+    expected_rows = get_table_count(con, table_name)
+    staging_name = f'_materialize_{table_name}'
+    LOGGER.info(f"Materializing view {table_name} into a table ({expected_rows} rows)...")
+    drop_relation_if_exists(con, staging_name)
+    try:
+        con.execute(f'CREATE TABLE {_quote_ident(staging_name)} AS SELECT {select_list} FROM {_quote_ident(table_name)};')
+        materialized_rows = get_table_count(con, staging_name)
+        if materialized_rows != expected_rows:
+            raise ValueError(
+                f"Materializing {table_name} produced {materialized_rows} rows but the view had "
+                f"{expected_rows}. The view has been left in place."
+            )
+        # only now is it safe to give up the view
+        con.execute(f'DROP VIEW {_quote_ident(table_name)};')
+        con.execute(f'ALTER TABLE {_quote_ident(staging_name)} RENAME TO {_quote_ident(table_name)};')
+    except Exception:
+        LOGGER.error(f"Fail to materialize pointer view: table={table_name}")
+        drop_relation_if_exists(con, staging_name)
+        raise
+    LOGGER.info(f"Materialized {table_name}: {materialized_rows} rows now held in the duckdb file.")
+    return materialized_rows
+
+
+def remove_submission_source(path: str):
+    """
+    Delete a submission file or part directory once its rows are held in the duckdb file.
+
+    This is what makes pointer mode cheaper on peak disk than copy mode when the deliverable
+    has to carry all the data: without it the parquet and the full duckdb coexist, exactly as
+    they do in copy mode. It is destructive and unrecoverable, so callers must materialize and
+    verify first.
+    """
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+    LOGGER.info(f"Removed submission source {path}; its rows are now in the duckdb file.")
 
 
 def init_duckdb_logging_schema(con: DuckDBPyConnection, run_id: str, run_config: dict, logging_schema = 'logging') -> DuckDBPyConnection:

@@ -1,6 +1,6 @@
 from src.config import CONFIG, LOGGER
 from src.dq_checks.check_result import CheckResult
-from src.load_duckdb import create_duckdb_tables, load_csv_to_duckdb, init_duckdb_logging_schema, load_parquet_to_duckdb, create_parquet_pointer_view
+from src.load_duckdb import create_duckdb_tables, load_csv_to_duckdb, init_duckdb_logging_schema, load_parquet_to_duckdb, create_parquet_pointer_view, materialize_pointer_view, remove_submission_source
 from src.data_model import DataModel
 from src.constants import OPTIONAL_TABLES
 from src.dq_checks.check_file_completeness import check_missing_submission_file, check_extra_submission_file
@@ -72,6 +72,17 @@ def main():
             raise ValueError(f"Unsupported submission_files.access_mode: {access_mode}. Supported values are 'copy' and 'pointer'.")
         if access_mode == 'pointer' and submission_file_format != 'parquet':
             raise NotImplementedError(f"access_mode 'pointer' is only implemented for parquet submissions, not {submission_file_format}.")
+        # What to do with the pointer views once the checks have run. 'off' leaves them as
+        # views; 'keep' and 'consume' copy their rows into the duckdb file so the file can be
+        # submitted on its own, and 'consume' additionally deletes each submission file once
+        # its rows are safely in the file, which is what keeps peak disk below copy mode's.
+        materialize_mode = CONFIG['submission_files'].get('materialize', 'off')
+        if materialize_mode not in ('off', 'keep', 'consume'):
+            raise ValueError(f"Unsupported submission_files.materialize: {materialize_mode}. Supported values are 'off', 'keep' and 'consume'.")
+        if materialize_mode != 'off' and access_mode != 'pointer':
+            raise ValueError(f"submission_files.materialize is only meaningful with access_mode 'pointer', not '{access_mode}'.")
+        # table_name -> the submission path its view reads, so 'consume' knows what to delete
+        context.pointer_sources = dict()
 
         LOGGER.debug("Checking submission files completeness.")
         required_cdm_tables = tuple(set(data_model.all_table_names()) - set(OPTIONAL_TABLES) - set(context.skip_duckdb_load_tables))
@@ -178,6 +189,7 @@ def main():
                     continue
                 if access_mode == 'pointer':
                     create_parquet_pointer_view(parquet_path=file_path, con=con, table_name=table_name, accept_additional_col=True)
+                    context.pointer_sources[table_name] = file_path
                 else:
                     LOGGER.info(f"Loading {file_path} into DuckDB table {table_name}.")
                     load_parquet_to_duckdb(parquet_path=file_path, con=con, table_name=table_name, accept_additional_col=True)
@@ -286,6 +298,30 @@ def main():
         
         # Summarize DQ results
         CheckResult.summary(LOGGER)
+
+        # Subsume the submission files into the duckdb file, now that every check has run.
+        # This has to come after the checks: the views are live handles on the parquet, so a
+        # table consumed early would pull the file out from under a check that still needs it.
+        if materialize_mode != 'off':
+            # deleting the submission after a failed run destroys the evidence needed to
+            # diagnose it, and the export may have to be regenerated anyway
+            consume = materialize_mode == 'consume'
+            if consume and len(CheckResult.dq_fail) > 0:
+                LOGGER.warning(
+                    f"{len(CheckResult.dq_fail)} DQ failure(s) in this run; materializing the "
+                    "submission files but keeping them on disk. Re-run once the failures are resolved to consume them."
+                )
+                consume = False
+            LOGGER.info(f"Materializing pointer views into the duckdb file (materialize={materialize_mode}).")
+            total_rows = 0
+            for table_name in sorted(context.pointer_sources):
+                total_rows += materialize_pointer_view(con=con, table_name=table_name, data_model=data_model)
+                if consume:
+                    remove_submission_source(context.pointer_sources[table_name])
+            # flush the freshly written rows out of the WAL and into the duckdb file itself
+            con.execute("CHECKPOINT;")
+            LOGGER.info(f"Materialized {len(context.pointer_sources)} table(s), {total_rows} rows total, into {CONFIG['duckdb']['path']}.")
+
         # Exit with code 1 if there is any DQ failure        
         if len(CheckResult.dq_fail) > 0:
             exit(1)

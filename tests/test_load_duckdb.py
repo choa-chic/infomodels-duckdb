@@ -1,3 +1,5 @@
+import os
+
 import duckdb
 import pytest
 
@@ -8,7 +10,10 @@ from src.load_duckdb import (
     create_duckdb_tables,
     create_parquet_pointer_view,
     drop_relation_if_exists,
+    get_relation_type,
     load_parquet_to_duckdb,
+    materialize_pointer_view,
+    remove_submission_source,
 )
 
 DATA_MODEL_PATH = 'tests/data/data_model/pedsnet_v57_data_model.json'
@@ -160,3 +165,107 @@ def test_runs_can_alternate_between_copy_and_pointer(tmp_path, data_model, parqu
 
 def test_drop_relation_if_exists_is_a_noop_when_absent(con):
     drop_relation_if_exists(con, 'no_such_table')
+
+
+def test_materialize_turns_the_view_into_a_table(tmp_path, con, data_model):
+    path = _write_parquet(tmp_path, 'care_site.parquet', "SELECT 1 AS care_site_id, 'clinic' AS care_site_name")
+    create_parquet_pointer_view(parquet_path=path, con=con, table_name=TABLE)
+    assert _relation_type(con, TABLE) == 'VIEW'
+
+    rows = materialize_pointer_view(con=con, table_name=TABLE, data_model=data_model)
+
+    assert rows == 1
+    assert _relation_type(con, TABLE) == 'BASE TABLE'
+    assert con.execute(f'SELECT care_site_name FROM "{TABLE}"').fetchone()[0] == 'clinic'
+
+
+def test_materialized_table_matches_copy_mode_exactly(tmp_path, data_model, parquet_copy_options):
+    """The whole point: what gets submitted must be what copy mode would have built."""
+    # column order differs from the data model's, one model column missing, one extra column
+    select_sql = "SELECT 'clinic' AS care_site_name, 1 AS care_site_id, 9 AS location_id, 'zz' AS extra_col"
+    path = _write_parquet(tmp_path, 'care_site.parquet', select_sql)
+
+    copied = duckdb.connect()
+    create_duckdb_tables(data_model, copied, recreate=True)
+    load_parquet_to_duckdb(parquet_path=path, con=copied, table_name=TABLE)
+
+    pointed = duckdb.connect()
+    create_duckdb_tables(data_model, pointed, recreate=True)
+    create_parquet_pointer_view(parquet_path=path, con=pointed, table_name=TABLE)
+    materialize_pointer_view(con=pointed, table_name=TABLE, data_model=data_model)
+
+    copied_desc = copied.execute(f'DESCRIBE "{TABLE}"').fetchall()
+    pointed_desc = pointed.execute(f'DESCRIBE "{TABLE}"').fetchall()
+    # not just the same columns -- the same columns in the same order, with the same types
+    assert [row[0] for row in pointed_desc] == [row[0] for row in copied_desc]
+    assert [row[1] for row in pointed_desc] == [row[1] for row in copied_desc]
+    assert pointed.execute(f'SELECT * FROM "{TABLE}"').fetchall() == copied.execute(f'SELECT * FROM "{TABLE}"').fetchall()
+    copied.close()
+    pointed.close()
+
+
+def test_materialized_rows_survive_deleting_the_parquet(tmp_path, con, data_model):
+    """After materializing, the duckdb file must stand on its own."""
+    path = _write_parquet(tmp_path, 'care_site.parquet', "SELECT 1 AS care_site_id, 'clinic' AS care_site_name")
+    create_parquet_pointer_view(parquet_path=path, con=con, table_name=TABLE)
+    materialize_pointer_view(con=con, table_name=TABLE, data_model=data_model)
+
+    remove_submission_source(path)
+
+    assert not os.path.exists(path)
+    assert con.execute(f'SELECT care_site_name FROM "{TABLE}"').fetchone()[0] == 'clinic'
+
+
+def test_unmaterialized_view_breaks_when_the_parquet_goes(tmp_path, con):
+    """Guards the ordering rule: consume before materializing and the rows are gone."""
+    path = _write_parquet(tmp_path, 'care_site.parquet', "SELECT 1 AS care_site_id")
+    create_parquet_pointer_view(parquet_path=path, con=con, table_name=TABLE)
+
+    remove_submission_source(path)
+
+    with pytest.raises(duckdb.Error):
+        con.execute(f'SELECT * FROM "{TABLE}"').fetchall()
+
+
+def test_materialize_combines_parquet_parts(tmp_path, con, data_model):
+    part_1 = _write_parquet(tmp_path, 'part_1.parquet', "SELECT 1 AS care_site_id, 'first' AS care_site_name")
+    part_2 = _write_parquet(tmp_path, 'part_2.parquet', "SELECT 'second' AS care_site_name, 2 AS care_site_id")
+    create_parquet_pointer_view(parquet_path=[part_1, part_2], con=con, table_name=TABLE)
+
+    assert materialize_pointer_view(con=con, table_name=TABLE, data_model=data_model) == 2
+
+    rows = con.execute(f'SELECT care_site_id, care_site_name FROM "{TABLE}" ORDER BY care_site_id').fetchall()
+    assert rows == [(1, 'first'), (2, 'second')]
+
+
+def test_materialize_is_idempotent_on_a_table(tmp_path, con, data_model):
+    """A re-run over an already materialized duckdb file must not destroy it."""
+    path = _write_parquet(tmp_path, 'care_site.parquet', "SELECT 1 AS care_site_id")
+    create_parquet_pointer_view(parquet_path=path, con=con, table_name=TABLE)
+    materialize_pointer_view(con=con, table_name=TABLE, data_model=data_model)
+
+    assert materialize_pointer_view(con=con, table_name=TABLE, data_model=data_model) == 1
+    assert _relation_type(con, TABLE) == 'BASE TABLE'
+
+
+def test_materialize_raises_on_a_missing_relation(con, data_model):
+    with pytest.raises(ValueError):
+        materialize_pointer_view(con=con, table_name='no_such_table', data_model=data_model)
+
+
+def test_materialize_leaves_no_staging_table_behind(tmp_path, con, data_model):
+    path = _write_parquet(tmp_path, 'care_site.parquet', "SELECT 1 AS care_site_id")
+    create_parquet_pointer_view(parquet_path=path, con=con, table_name=TABLE)
+    materialize_pointer_view(con=con, table_name=TABLE, data_model=data_model)
+
+    assert get_relation_type(con, f'_materialize_{TABLE}') is None
+
+
+def test_remove_submission_source_handles_a_part_directory(tmp_path):
+    part_dir = tmp_path / 'measurement'
+    part_dir.mkdir()
+    _write_parquet(part_dir, 'part_1.parquet', "SELECT 1 AS measurement_id")
+
+    remove_submission_source(str(part_dir))
+
+    assert not os.path.exists(part_dir)

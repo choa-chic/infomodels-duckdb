@@ -104,6 +104,30 @@ Notes:
 - Because the rows are not copied, the parquet files must stay readable for the whole run.
 - A value that does not fit its declared type raises when the check that touches it runs, rather than when the file is loaded.
 
+### Subsuming the submission files into the DuckDB file
+
+`submission_files.materialize` turns the pointer views into real tables once every check has run, so the DuckDB file can be submitted on its own with all of the data inside it. It only applies when `access_mode: pointer`.
+
+- `off` (default) leaves the pointer views as views. The DuckDB file is only usable while the parquet files are still in place.
+- `keep` copies each view's rows into a table and leaves the parquet files alone.
+- `consume` copies each view's rows into a table and then deletes that table's submission file. This is what keeps peak disk below `copy` mode's: the parquet files go away one at a time as the DuckDB file grows, instead of both existing in full at once.
+
+```yaml
+submission_files:
+    dir: /PATH/TO/DIR/WITH/PARQUET/FILES
+    file_format: parquet
+    access_mode: pointer
+    materialize: consume
+```
+
+A materialized table is identical to the one `copy` mode would have built -- same columns, in the data model's order, with the same types -- so the resulting file does not depend on which mode produced it.
+
+Notes:
+- Materializing happens after every check, never during. The views are live handles on the parquet, so consuming a file early would pull it out from under a check that still needs it.
+- Each table is built and its row count verified before its view is dropped, so a failure part way through leaves the view in place.
+- `consume` deletes submission files permanently. If the run recorded any DQ failure it declines to delete and logs a warning, since the files are what you need to diagnose the failure. Only run it against an export you can regenerate.
+- `materialize` is rejected with `access_mode: copy`, where the rows are already in the file.
+
 ## Implemented Checks
 
 The following data quality checks are currently supported:

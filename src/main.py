@@ -1,6 +1,6 @@
 from src.config import CONFIG, LOGGER
 from src.dq_checks.check_result import CheckResult
-from src.load_duckdb import create_duckdb_tables, load_csv_to_duckdb, init_duckdb_logging_schema, load_parquet_to_duckdb
+from src.load_duckdb import create_duckdb_tables, load_csv_to_duckdb, init_duckdb_logging_schema, load_parquet_to_duckdb, create_parquet_pointer_view
 from src.data_model import DataModel
 from src.constants import OPTIONAL_TABLES
 from src.dq_checks.check_file_completeness import check_missing_submission_file, check_extra_submission_file
@@ -65,6 +65,13 @@ def main():
         submission_dir = CONFIG['submission_files']['dir']
         submission_file_format = CONFIG['submission_files'].get('file_format', 'csv')
         if_multiple_file_per_table = CONFIG['submission_files'].get('multiple_file_per_table', False)
+        # 'copy' materializes rows into duckdb tables; 'pointer' leaves the rows in the
+        # submission files and exposes them as views, so no second copy lands on disk.
+        access_mode = CONFIG['submission_files'].get('access_mode', 'copy')
+        if access_mode not in ('copy', 'pointer'):
+            raise ValueError(f"Unsupported submission_files.access_mode: {access_mode}. Supported values are 'copy' and 'pointer'.")
+        if access_mode == 'pointer' and submission_file_format != 'parquet':
+            raise NotImplementedError(f"access_mode 'pointer' is only implemented for parquet submissions, not {submission_file_format}.")
 
         LOGGER.debug("Checking submission files completeness.")
         required_cdm_tables = tuple(set(data_model.all_table_names()) - set(OPTIONAL_TABLES) - set(context.skip_duckdb_load_tables))
@@ -137,7 +144,7 @@ def main():
                 if check_result_missing_column.status != 'PASS':
                     context.skip_check_columns[table_name] = context.skip_check_columns.get(table_name, tuple()) + check_result_missing_column.column_name
         # Load submission files into DuckDB
-        LOGGER.info("Loading submission files into DuckDB.")
+        LOGGER.info(f"Preparing submission files in DuckDB with access_mode={access_mode}.")
         # TODO: implement csv load for multiple files per table later
         if submission_file_format == 'csv' and if_multiple_file_per_table:
             raise NotImplementedError("Loading multiple files per table in CSV format into DuckDB is not implemented yet. Please merge your csv files into single file per table.")
@@ -169,11 +176,14 @@ def main():
                 if table_name in context.skip_duckdb_load_tables:
                     LOGGER.debug(f"Skipping loading {table_name} to DuckDB as it is in the skip list.")
                     continue
-                LOGGER.info(f"Loading {file_path} into DuckDB table {table_name}.")
-                load_parquet_to_duckdb(parquet_path=file_path, con=con, table_name=table_name, accept_additional_col=True)
+                if access_mode == 'pointer':
+                    create_parquet_pointer_view(parquet_path=file_path, con=con, table_name=table_name, accept_additional_col=True)
+                else:
+                    LOGGER.info(f"Loading {file_path} into DuckDB table {table_name}.")
+                    load_parquet_to_duckdb(parquet_path=file_path, con=con, table_name=table_name, accept_additional_col=True)
 
 
-        LOGGER.info("All submission files loaded into DuckDB successfully.")
+        LOGGER.info(f"All submission files prepared in DuckDB successfully with access_mode={access_mode}.")
         
         # Check foreign key violations
         LOGGER.info("Checking foreign key violations.") 

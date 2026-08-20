@@ -83,6 +83,27 @@ It provides utilities to validate data integrity rules, such as constraints and 
    python3 -m src.main
    ```
 
+## Access Modes
+
+`submission_files.access_mode` controls whether the submission data is copied into the DuckDB file or read in place.
+
+- `copy` (default) loads each table's rows into a DuckDB table. This is the original behaviour.
+- `pointer` creates a DuckDB view over the parquet files instead. The rows stay in the parquet, so the run does not write a second copy of the data to disk. Currently implemented for `file_format: parquet` only.
+
+```yaml
+submission_files:
+    dir: /PATH/TO/DIR/WITH/PARQUET/FILES
+    file_format: parquet
+    access_mode: pointer
+```
+
+Pointer views are shaped like the tables `copy` mode would have built: column names are lower-cased and cast to the data model's declared types, columns the data model defines but the file omits are exposed as typed NULLs, and columns present in the file but absent from the data model are exposed as VARCHAR. Every check therefore behaves the same in either mode.
+
+Notes:
+- When a table has several parquet parts, they are combined with `union_by_name`, so parts written with differing column orders still line up by column name.
+- Because the rows are not copied, the parquet files must stay readable for the whole run.
+- A value that does not fit its declared type raises when the check that touches it runs, rather than when the file is loaded.
+
 ## Implemented Checks
 
 The following data quality checks are currently supported:

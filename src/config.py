@@ -1,8 +1,10 @@
 import yaml
 import logging
+import os
 import sys
 
-CONFIG_FILE = 'config.yml'
+# INFOMODELS_CONFIG lets a run (or the test suite) point at a config outside the cwd
+CONFIG_FILE = os.environ.get('INFOMODELS_CONFIG', 'config.yml')
 
 with open(CONFIG_FILE, "r") as f:
     CONFIG = yaml.safe_load(f)

@@ -1,4 +1,4 @@
-from src.config import CONFIG, LOGGER
+from src.config import CONFIG, CONFIG_FILE_PATH, LOGGER, warn_unrecognized_settings
 from src.dq_checks.check_result import CheckResult
 from src.load_duckdb import create_duckdb_tables, load_csv_to_duckdb, init_duckdb_logging_schema, load_parquet_to_duckdb, create_parquet_pointer_view
 from src.data_model import DataModel
@@ -72,6 +72,20 @@ def main():
             raise ValueError(f"Unsupported submission_files.access_mode: {access_mode}. Supported values are 'copy' and 'pointer'.")
         if access_mode == 'pointer' and submission_file_format != 'parquet':
             raise NotImplementedError(f"access_mode 'pointer' is only implemented for parquet submissions, not {submission_file_format}.")
+
+        # State what this run resolved, not what the file asked for. The config dump above
+        # prints the yaml as written, including settings this build may not read, so it
+        # cannot be used to tell which mode a run actually used.
+        warn_unrecognized_settings()
+        LOGGER.info(
+            "Effective settings: "
+            f"config={CONFIG_FILE_PATH}, "
+            f"submission_dir={submission_dir}, "
+            f"file_format={submission_file_format}, "
+            f"multiple_file_per_table={if_multiple_file_per_table}, "
+            f"access_mode={access_mode}, "
+            f"duckdb={CONFIG['duckdb']['path']}"
+        )
 
         LOGGER.debug("Checking submission files completeness.")
         required_cdm_tables = tuple(set(data_model.all_table_names()) - set(OPTIONAL_TABLES) - set(context.skip_duckdb_load_tables))

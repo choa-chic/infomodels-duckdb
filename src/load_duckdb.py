@@ -144,6 +144,76 @@ def create_parquet_pointer_view(
     return con
 
 
+def record_pointer_source(con: DuckDBPyConnection, run_id: str, table_name: str, source_path: str, logging_schema: str = 'logging'):
+    """
+    Record which submission path a pointer view reads.
+
+    A view knows its parquet only inside its own SQL. Writing the mapping into the duckdb
+    file lets a later process -- a separate materialize stage, run once a human has read the
+    DQ results -- know what it is allowed to delete without parsing view definitions.
+    """
+    con.execute(
+        f"INSERT INTO {logging_schema}.pointer_source (run_id, log_time, table_name, source_path) "
+        "VALUES (?, current_localtimestamp(), ?, ?);",
+        (run_id, table_name, source_path)
+    )
+
+
+def get_pointer_sources(con: DuckDBPyConnection, run_id: str = None, logging_schema: str = 'logging') -> dict:
+    """
+    Return {table_name: source_path} for pointer views, most recent record per table.
+
+    Defaults to the latest run, which is the one whose views are currently in the file.
+    """
+    if not table_exists(con, 'pointer_source', schema=logging_schema):
+        return dict()
+    if run_id is None:
+        run_id = get_latest_run_id(con, logging_schema=logging_schema)
+    if run_id is None:
+        return dict()
+    rows = con.execute(
+        f"SELECT table_name, source_path FROM {logging_schema}.pointer_source "
+        "WHERE run_id = ? QUALIFY row_number() OVER (PARTITION BY table_name ORDER BY log_time DESC) = 1;",
+        (run_id,)
+    ).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+def get_latest_run_id(con: DuckDBPyConnection, logging_schema: str = 'logging') -> str:
+    """Return the run_id of the most recently started run, or None if the file has none."""
+    if not table_exists(con, 'run', schema=logging_schema):
+        return None
+    row = con.execute(f"SELECT run_id FROM {logging_schema}.run ORDER BY start_time DESC LIMIT 1;").fetchone()
+    return None if row is None else row[0]
+
+
+def get_dq_failure_count(con: DuckDBPyConnection, run_id: str = None, logging_schema: str = 'logging') -> int:
+    """
+    Count FAIL rows recorded by a run, so a later stage can see how the checks went.
+
+    Defaults to the latest run.
+    """
+    if not table_exists(con, 'dq', schema=logging_schema):
+        return 0
+    if run_id is None:
+        run_id = get_latest_run_id(con, logging_schema=logging_schema)
+    if run_id is None:
+        return 0
+    row = con.execute(
+        f"SELECT count(*) FROM {logging_schema}.dq WHERE run_id = ? AND status = 'FAIL';",
+        (run_id,)
+    ).fetchone()
+    return 0 if row is None else row[0]
+
+
+def list_pointer_views(con: DuckDBPyConnection, data_model: DataModel) -> List[str]:
+    """Return the CDM tables currently exposed as views, in a stable order."""
+    return sorted(
+        table for table in data_model.all_table_names()
+        if get_relation_type(con, table) == 'VIEW'
+    )
+
+
 def materialize_pointer_view(con: DuckDBPyConnection, table_name: str, data_model: DataModel) -> int:
     """
     Replace a pointer view with a real table holding the same rows.
@@ -218,6 +288,53 @@ def remove_submission_source(path: str):
     LOGGER.info(f"Removed submission source {path}; its rows are now in the duckdb file.")
 
 
+def materialize_pointer_views(
+        con: DuckDBPyConnection,
+        data_model: DataModel,
+        consume: bool = False,
+        sources: dict = None
+    ) -> dict:
+    """
+    Turn every pointer view in the file into a table, optionally deleting its source.
+
+    Shared by the one-shot path in main() and by the separate materialize stage, so both
+    produce the same duckdb file. Each table is materialized and verified before its source
+    is removed, and a table whose source is unknown is materialized but never deleted.
+
+    Parameters:
+    - con: DuckDBPyConnection, a duckdb connection.
+    - data_model: DataModel, the authority on column order.
+    - consume: bool, if True delete each submission source once its rows are in the file.
+    - sources: dict of {table_name: source_path}; required for consume.
+
+    Returns:
+    - dict summary with the tables materialized, rows written and sources removed.
+    """
+    sources = sources or dict()
+    views = list_pointer_views(con, data_model)
+    if not views:
+        LOGGER.info("No pointer views to materialize.")
+        return {'tables': [], 'rows': 0, 'removed': [], 'unknown_source': []}
+    materialized, removed, unknown_source, total_rows = [], [], [], 0
+    for table_name in views:
+        total_rows += materialize_pointer_view(con=con, table_name=table_name, data_model=data_model)
+        materialized.append(table_name)
+        if not consume:
+            continue
+        source_path = sources.get(table_name)
+        if source_path is None:
+            # never guess at what to delete
+            LOGGER.warning(f"No recorded submission source for {table_name}; materialized but not consumed.")
+            unknown_source.append(table_name)
+            continue
+        remove_submission_source(source_path)
+        removed.append(source_path)
+    # flush the freshly written rows out of the WAL and into the duckdb file itself
+    con.execute("CHECKPOINT;")
+    LOGGER.info(f"Materialized {len(materialized)} table(s), {total_rows} rows total. Removed {len(removed)} submission source(s).")
+    return {'tables': materialized, 'rows': total_rows, 'removed': removed, 'unknown_source': unknown_source}
+
+
 def init_duckdb_logging_schema(con: DuckDBPyConnection, run_id: str, run_config: dict, logging_schema = 'logging') -> DuckDBPyConnection:
     con.execute(f"""
     CREATE SCHEMA IF NOT EXISTS {logging_schema};
@@ -246,6 +363,12 @@ def init_duckdb_logging_schema(con: DuckDBPyConnection, run_id: str, run_config:
         start_time TIMESTAMP,
         end_time TIMESTAMP,
         config STRING
+    );
+    CREATE TABLE IF NOT EXISTS {logging_schema}.pointer_source (
+        run_id VARCHAR,
+        log_time TIMESTAMP,
+        table_name VARCHAR,
+        source_path VARCHAR
     );
     """)
     # insert a new run

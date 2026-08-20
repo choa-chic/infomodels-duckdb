@@ -106,27 +106,58 @@ Notes:
 
 ### Subsuming the submission files into the DuckDB file
 
-`submission_files.materialize` turns the pointer views into real tables once every check has run, so the DuckDB file can be submitted on its own with all of the data inside it. It only applies when `access_mode: pointer`.
+A pointer-mode run leaves the CDM as views, so the DuckDB file is only usable while the submission files are still in place. Materializing turns those views into real tables, so the file can be submitted on its own with all of the data inside it.
 
-- `off` (default) leaves the pointer views as views. The DuckDB file is only usable while the parquet files are still in place.
-- `keep` copies each view's rows into a table and leaves the parquet files alone.
-- `consume` copies each view's rows into a table and then deletes that table's submission file. This is what keeps peak disk below `copy` mode's: the parquet files go away one at a time as the DuckDB file grows, instead of both existing in full at once.
+This is a second stage, run after the checks:
+
+```bash
+python3 -m src.main                            # stage 1: checks, over views, no copy of the data
+# review the results: SELECT * FROM logging.dq WHERE status = 'FAIL';
+python3 -m src.materialize --consume           # stage 2: views -> tables, submission files deleted
+```
+
+Splitting it in two is what makes `--consume` safe to offer. The DQ results are already written to the DuckDB file by the time anyone decides to delete the submission files, so that decision is made by a person who has read the report.
+
+| command | effect |
+|---|---|
+| `python3 -m src.materialize` | views become tables; submission files untouched |
+| `python3 -m src.materialize --consume` | ... and each submission file is deleted once its rows are in the DuckDB file |
+| `python3 -m src.materialize --consume --force` | ... even though the run recorded DQ failures |
+| `python3 -m src.materialize --run-id RUN` | use an earlier run's results and recorded paths |
+
+Both stages read the same `config.yml`. Stage 2 needs no new settings: it finds the views in the DuckDB file and the submission paths in `logging.pointer_source`, both written by stage 1.
+
+**`--consume` is the option that saves disk.** Without it the submission files and the full DuckDB file exist at the same time, exactly as they do in `copy` mode. Consuming deletes them one at a time as the DuckDB file grows, so peak disk is what remains of the submission plus what has been written so far, rather than both in full.
+
+**`--consume` refuses to run if the checks recorded any failure.** The submission files are what you need to diagnose a failure, and deleting them cannot be undone, so it stops and tells you what to look at. `--force` overrides it once you have decided the failures are expected. Materializing is never blocked — only deleting is.
+
+#### Doing it in one command
+
+For an automated pipeline that does not stop for review, `submission_files.materialize` does the same work at the end of the check run:
 
 ```yaml
 submission_files:
     dir: /PATH/TO/DIR/WITH/PARQUET/FILES
     file_format: parquet
     access_mode: pointer
-    materialize: consume
+    materialize: consume            # 'off' (default), 'keep' or 'consume'
+    consume_with_dq_failures: false # the equivalent of --force
 ```
 
-A materialized table is identical to the one `copy` mode would have built -- same columns, in the data model's order, with the same types -- so the resulting file does not depend on which mode produced it.
+#### Notes
 
-Notes:
-- Materializing happens after every check, never during. The views are live handles on the parquet, so consuming a file early would pull it out from under a check that still needs it.
+- A materialized table is identical to the one `copy` mode would have built -- same columns, in the data model's order, with the same types -- so the resulting file does not depend on which mode produced it.
+- Materializing happens only after every check. The views are live handles on the submission files, so consuming one early would pull it out from under a check that still needs it.
 - Each table is built and its row count verified before its view is dropped, so a failure part way through leaves the view in place.
-- `consume` deletes submission files permanently. If the run recorded any DQ failure it declines to delete and logs a warning, since the files are what you need to diagnose the failure. Only run it against an export you can regenerate.
-- `materialize` is rejected with `access_mode: copy`, where the rows are already in the file.
+- A table whose source path was not recorded is materialized but never deleted.
+- DuckDB does not reclaim the space its views occupied, so a materialized file is somewhat larger than one `copy` mode wrote in a single pass. If the submitted file's size matters, compact it once the submission files are gone -- this needs room for both files at once:
+
+  ```python
+  import duckdb
+  con = duckdb.connect()
+  con.execute("ATTACH 'cdm.duckdb' AS s (READ_ONLY); ATTACH 'cdm_compact.duckdb' AS d;")
+  con.execute("COPY FROM DATABASE s TO d;")
+  ```
 
 ## Implemented Checks
 

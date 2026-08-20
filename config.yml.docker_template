@@ -9,6 +9,7 @@ submission_files:
   multiple_file_per_table: false  # Set to false if each table is a single file named {table_name}.csv or {table_name}.parquet. Set to true if each table can have multiple files in a folder named after the table. Currently only support parquet
   access_mode: copy  # 'copy' loads rows into the duckdb file. 'pointer' creates views over the parquet files instead, so no second copy of the data lands on disk. Currently only supports parquet
   materialize: off  # only used with access_mode 'pointer'. 'off' leaves the views as views. 'keep' copies their rows into the duckdb file after the checks run, so the file can be submitted on its own. 'consume' does the same and then deletes each submission file once its rows are in the file
+  consume_with_dq_failures: false  # only used with materialize 'consume'. Submission files are kept when a run records DQ failures, since they are what you need to diagnose them. Set true to delete anyway. Prefer the two stage flow: python3 -m src.materialize --consume --force
 
 duckdb:
   path: /result/cdm.duckdb # THIS IS A MOUNTED VOLUME IN DOCKER. DO NOT CHANGE!

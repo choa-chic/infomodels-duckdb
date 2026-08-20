@@ -80,9 +80,9 @@ def table_exists(con, table_name: str, schema: str = None) -> bool:
         bool: True if the table exists, False otherwise.
     """
     if schema:
-        sql = f"""
-            f'SHOW TABLES FROM "{schema}";'
-        """
+        # the f-prefix used to be inside the string literal, which made this branch
+        # send the text f'SHOW TABLES FROM "..."' to duckdb and always raise
+        sql = f'SHOW TABLES FROM "{schema}";'
     else:
         sql = f"""
             SHOW TABLES;

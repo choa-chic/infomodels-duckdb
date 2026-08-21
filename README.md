@@ -106,6 +106,10 @@ Notes:
 
 ### Subsuming the submission files into the DuckDB file
 
+> For the operational procedure -- preconditions, verification at each step, and recovery
+> from the ways this goes wrong -- see
+> [docs/runbooks/pointer-then-consume.md](docs/runbooks/pointer-then-consume.md).
+
 A pointer-mode run leaves the CDM as views, so the DuckDB file is only usable while the submission files are still in place. Materializing turns those views into real tables, so the file can be submitted on its own with all of the data inside it.
 
 This is a second stage, run after the checks:

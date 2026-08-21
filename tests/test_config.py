@@ -55,3 +55,17 @@ def test_tolerates_a_missing_submission_files_block(monkeypatch):
 
 def test_config_file_path_is_absolute():
     assert CONFIG_FILE_PATH.startswith('/')
+
+
+def test_known_settings_cover_the_materialize_ones():
+    """This branch reads these; without them a valid config would be reported as ignored."""
+    for setting in ('materialize', 'consume_with_dq_failures'):
+        assert setting in KNOWN_SUBMISSION_FILE_SETTINGS
+
+
+def test_a_full_materialize_config_raises_no_warning(monkeypatch):
+    monkeypatch.setitem(CONFIG, 'submission_files', {
+        'dir': '/data', 'file_format': 'parquet', 'multiple_file_per_table': True,
+        'access_mode': 'pointer', 'materialize': 'consume', 'consume_with_dq_failures': False,
+    })
+    assert warn_unrecognized_settings(_Recorder()) == []

@@ -19,6 +19,8 @@ KNOWN_SUBMISSION_FILE_SETTINGS = frozenset({
     'file_format',
     'multiple_file_per_table',
     'access_mode',
+    'materialize',
+    'consume_with_dq_failures',
 })
 
 

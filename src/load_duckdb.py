@@ -1,4 +1,6 @@
 from typing import List
+import os
+import shutil
 from src.util import get_csv_header, get_table_count, get_parquet_header, table_exists
 from src.config import CONFIG, LOGGER
 from duckdb import DuckDBPyConnection
@@ -15,6 +17,17 @@ def _quote_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def get_relation_type(con: DuckDBPyConnection, table_name: str):
+    """
+    Return 'VIEW', 'BASE TABLE' or None for a relation, so callers can branch on its type.
+    """
+    row = con.execute(
+        "SELECT table_type FROM information_schema.tables WHERE lower(table_name) = lower(?)",
+        (table_name,)
+    ).fetchone()
+    return None if row is None else row[0]
+
+
 def drop_relation_if_exists(con: DuckDBPyConnection, table_name: str):
     """
     Drop a CDM relation whatever its type, so copy and pointer runs can alternate.
@@ -22,13 +35,10 @@ def drop_relation_if_exists(con: DuckDBPyConnection, table_name: str):
     DROP TABLE IF EXISTS raises on a view and DROP VIEW IF EXISTS raises on a table,
     so a run that re-uses an existing duckdb file has to look the type up first.
     """
-    relation_type = con.execute(
-        "SELECT table_type FROM information_schema.tables WHERE lower(table_name) = lower(?)",
-        (table_name,)
-    ).fetchone()
+    relation_type = get_relation_type(con, table_name)
     if relation_type is None:
         return
-    if relation_type[0] == 'VIEW':
+    if relation_type == 'VIEW':
         con.execute(f'DROP VIEW IF EXISTS {_quote_ident(table_name)};')
     else:
         con.execute(f'DROP TABLE IF EXISTS {_quote_ident(table_name)};')
@@ -134,6 +144,197 @@ def create_parquet_pointer_view(
     return con
 
 
+def record_pointer_source(con: DuckDBPyConnection, run_id: str, table_name: str, source_path: str, logging_schema: str = 'logging'):
+    """
+    Record which submission path a pointer view reads.
+
+    A view knows its parquet only inside its own SQL. Writing the mapping into the duckdb
+    file lets a later process -- a separate materialize stage, run once a human has read the
+    DQ results -- know what it is allowed to delete without parsing view definitions.
+    """
+    con.execute(
+        f"INSERT INTO {logging_schema}.pointer_source (run_id, log_time, table_name, source_path) "
+        "VALUES (?, current_localtimestamp(), ?, ?);",
+        (run_id, table_name, source_path)
+    )
+
+
+def get_pointer_sources(con: DuckDBPyConnection, run_id: str = None, logging_schema: str = 'logging') -> dict:
+    """
+    Return {table_name: source_path} for pointer views, most recent record per table.
+
+    Defaults to the latest run, which is the one whose views are currently in the file.
+    """
+    if not table_exists(con, 'pointer_source', schema=logging_schema):
+        return dict()
+    if run_id is None:
+        run_id = get_latest_run_id(con, logging_schema=logging_schema)
+    if run_id is None:
+        return dict()
+    rows = con.execute(
+        f"SELECT table_name, source_path FROM {logging_schema}.pointer_source "
+        "WHERE run_id = ? QUALIFY row_number() OVER (PARTITION BY table_name ORDER BY log_time DESC) = 1;",
+        (run_id,)
+    ).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+def get_latest_run_id(con: DuckDBPyConnection, logging_schema: str = 'logging') -> str:
+    """Return the run_id of the most recently started run, or None if the file has none."""
+    if not table_exists(con, 'run', schema=logging_schema):
+        return None
+    row = con.execute(f"SELECT run_id FROM {logging_schema}.run ORDER BY start_time DESC LIMIT 1;").fetchone()
+    return None if row is None else row[0]
+
+
+def get_dq_failure_count(con: DuckDBPyConnection, run_id: str = None, logging_schema: str = 'logging') -> int:
+    """
+    Count FAIL rows recorded by a run, so a later stage can see how the checks went.
+
+    Defaults to the latest run.
+    """
+    if not table_exists(con, 'dq', schema=logging_schema):
+        return 0
+    if run_id is None:
+        run_id = get_latest_run_id(con, logging_schema=logging_schema)
+    if run_id is None:
+        return 0
+    row = con.execute(
+        f"SELECT count(*) FROM {logging_schema}.dq WHERE run_id = ? AND status = 'FAIL';",
+        (run_id,)
+    ).fetchone()
+    return 0 if row is None else row[0]
+
+
+def list_pointer_views(con: DuckDBPyConnection, data_model: DataModel) -> List[str]:
+    """Return the CDM tables currently exposed as views, in a stable order."""
+    return sorted(
+        table for table in data_model.all_table_names()
+        if get_relation_type(con, table) == 'VIEW'
+    )
+
+
+def materialize_pointer_view(con: DuckDBPyConnection, table_name: str, data_model: DataModel) -> int:
+    """
+    Replace a pointer view with a real table holding the same rows.
+
+    Pointer mode leaves the rows in the parquet, which is what makes the checks cheap,
+    but a submission has to be a single duckdb file that carries its own data. The view
+    is already cast to the data model's declared types, so selecting from it in the data
+    model's column order reproduces the table copy mode would have built, column for
+    column. Columns the parquet added are appended as copy mode appends them.
+
+    The swap is staged: the new table is built and its row count verified before the view
+    is dropped, so a failure part way through leaves the view intact.
+
+    Parameters:
+    - con: DuckDBPyConnection, a duckdb connection.
+    - data_model: DataModel, the authority on column order for this table.
+    - table_name: str, the name of the CDM relation to materialize.
+
+    Returns:
+    - int, the number of rows materialized.
+    """
+    relation_type = get_relation_type(con, table_name)
+    if relation_type is None:
+        raise ValueError(f"No relation named {table_name} to materialize.")
+    if relation_type != 'VIEW':
+        # already a table -- a copy-mode run, or a re-run over an already materialized file
+        LOGGER.debug(f"{table_name} is already a {relation_type}, nothing to materialize.")
+        return get_table_count(con, table_name)
+
+    view_columns = [row[0] for row in con.execute(f'DESCRIBE {_quote_ident(table_name)}').fetchall()]
+    model_columns = [col for col in data_model.all_column_names_in_table(table_name) if col in view_columns]
+    extra_columns = [col for col in view_columns if col not in model_columns]
+    ordered_columns = model_columns + extra_columns
+    select_list = ', '.join(_quote_ident(col) for col in ordered_columns)
+
+    expected_rows = get_table_count(con, table_name)
+    staging_name = f'_materialize_{table_name}'
+    LOGGER.info(f"Materializing view {table_name} into a table ({expected_rows} rows)...")
+    drop_relation_if_exists(con, staging_name)
+    try:
+        con.execute(f'CREATE TABLE {_quote_ident(staging_name)} AS SELECT {select_list} FROM {_quote_ident(table_name)};')
+        materialized_rows = get_table_count(con, staging_name)
+        if materialized_rows != expected_rows:
+            raise ValueError(
+                f"Materializing {table_name} produced {materialized_rows} rows but the view had "
+                f"{expected_rows}. The view has been left in place."
+            )
+        # only now is it safe to give up the view
+        con.execute(f'DROP VIEW {_quote_ident(table_name)};')
+        con.execute(f'ALTER TABLE {_quote_ident(staging_name)} RENAME TO {_quote_ident(table_name)};')
+    except Exception:
+        LOGGER.error(f"Fail to materialize pointer view: table={table_name}")
+        drop_relation_if_exists(con, staging_name)
+        raise
+    LOGGER.info(f"Materialized {table_name}: {materialized_rows} rows now held in the duckdb file.")
+    return materialized_rows
+
+
+def remove_submission_source(path: str):
+    """
+    Delete a submission file or part directory once its rows are held in the duckdb file.
+
+    This is what makes pointer mode cheaper on peak disk than copy mode when the deliverable
+    has to carry all the data: without it the parquet and the full duckdb coexist, exactly as
+    they do in copy mode. It is destructive and unrecoverable, so callers must materialize and
+    verify first.
+    """
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+    LOGGER.info(f"Removed submission source {path}; its rows are now in the duckdb file.")
+
+
+def materialize_pointer_views(
+        con: DuckDBPyConnection,
+        data_model: DataModel,
+        consume: bool = False,
+        sources: dict = None
+    ) -> dict:
+    """
+    Turn every pointer view in the file into a table, optionally deleting its source.
+
+    Shared by the one-shot path in main() and by the separate materialize stage, so both
+    produce the same duckdb file. Each table is materialized and verified before its source
+    is removed, and a table whose source is unknown is materialized but never deleted.
+
+    Parameters:
+    - con: DuckDBPyConnection, a duckdb connection.
+    - data_model: DataModel, the authority on column order.
+    - consume: bool, if True delete each submission source once its rows are in the file.
+    - sources: dict of {table_name: source_path}; required for consume.
+
+    Returns:
+    - dict summary with the tables materialized, rows written and sources removed.
+    """
+    sources = sources or dict()
+    views = list_pointer_views(con, data_model)
+    if not views:
+        LOGGER.info("No pointer views to materialize.")
+        return {'tables': [], 'rows': 0, 'removed': [], 'unknown_source': []}
+    materialized, removed, unknown_source, total_rows = [], [], [], 0
+    for table_name in views:
+        total_rows += materialize_pointer_view(con=con, table_name=table_name, data_model=data_model)
+        materialized.append(table_name)
+        if not consume:
+            continue
+        source_path = sources.get(table_name)
+        if source_path is None:
+            # never guess at what to delete
+            LOGGER.warning(f"No recorded submission source for {table_name}; materialized but not consumed.")
+            unknown_source.append(table_name)
+            continue
+        remove_submission_source(source_path)
+        removed.append(source_path)
+    # flush the freshly written rows out of the WAL and into the duckdb file itself
+    con.execute("CHECKPOINT;")
+    LOGGER.info(f"Materialized {len(materialized)} table(s), {total_rows} rows total. Removed {len(removed)} submission source(s).")
+    return {'tables': materialized, 'rows': total_rows, 'removed': removed, 'unknown_source': unknown_source}
+
+
 def init_duckdb_logging_schema(con: DuckDBPyConnection, run_id: str, run_config: dict, logging_schema = 'logging') -> DuckDBPyConnection:
     con.execute(f"""
     CREATE SCHEMA IF NOT EXISTS {logging_schema};
@@ -162,6 +363,12 @@ def init_duckdb_logging_schema(con: DuckDBPyConnection, run_id: str, run_config:
         start_time TIMESTAMP,
         end_time TIMESTAMP,
         config STRING
+    );
+    CREATE TABLE IF NOT EXISTS {logging_schema}.pointer_source (
+        run_id VARCHAR,
+        log_time TIMESTAMP,
+        table_name VARCHAR,
+        source_path VARCHAR
     );
     """)
     # insert a new run

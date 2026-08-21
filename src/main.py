@@ -1,6 +1,6 @@
 from src.config import CONFIG, CONFIG_FILE_PATH, LOGGER, warn_unrecognized_settings
 from src.dq_checks.check_result import CheckResult
-from src.load_duckdb import create_duckdb_tables, load_csv_to_duckdb, init_duckdb_logging_schema, load_parquet_to_duckdb, create_parquet_pointer_view
+from src.load_duckdb import create_duckdb_tables, load_csv_to_duckdb, init_duckdb_logging_schema, load_parquet_to_duckdb, create_parquet_pointer_view, materialize_pointer_views, record_pointer_source, get_pointer_sources
 from src.data_model import DataModel
 from src.constants import OPTIONAL_TABLES
 from src.dq_checks.check_file_completeness import check_missing_submission_file, check_extra_submission_file
@@ -72,6 +72,20 @@ def main():
             raise ValueError(f"Unsupported submission_files.access_mode: {access_mode}. Supported values are 'copy' and 'pointer'.")
         if access_mode == 'pointer' and submission_file_format != 'parquet':
             raise NotImplementedError(f"access_mode 'pointer' is only implemented for parquet submissions, not {submission_file_format}.")
+        # What to do with the pointer views once the checks have run. 'off' leaves them as
+        # views; 'keep' and 'consume' copy their rows into the duckdb file so the file can be
+        # submitted on its own, and 'consume' additionally deletes each submission file once
+        # its rows are safely in the file, which is what keeps peak disk below copy mode's.
+        materialize_mode = CONFIG['submission_files'].get('materialize', 'off')
+        if materialize_mode not in ('off', 'keep', 'consume'):
+            raise ValueError(f"Unsupported submission_files.materialize: {materialize_mode}. Supported values are 'off', 'keep' and 'consume'.")
+        if materialize_mode != 'off' and access_mode != 'pointer':
+            raise ValueError(f"submission_files.materialize is only meaningful with access_mode 'pointer', not '{access_mode}'.")
+        # Deleting the submission after a failed run destroys what is needed to diagnose it,
+        # so a one-shot consume stops at the first DQ failure unless this is set. The two
+        # stage flow (python -m src.materialize --consume --force) is the better way to
+        # override, since by then the DQ results are in the file to be read first.
+        consume_with_dq_failures = CONFIG['submission_files'].get('consume_with_dq_failures', False)
 
         # State what this run resolved, not what the file asked for. The config dump above
         # prints the yaml as written, including settings this build may not read, so it
@@ -192,6 +206,8 @@ def main():
                     continue
                 if access_mode == 'pointer':
                     create_parquet_pointer_view(parquet_path=file_path, con=con, table_name=table_name, accept_additional_col=True)
+                    # persisted, so a later `python -m src.materialize` knows what it may delete
+                    record_pointer_source(con, run_id, table_name, file_path)
                 else:
                     LOGGER.info(f"Loading {file_path} into DuckDB table {table_name}.")
                     load_parquet_to_duckdb(parquet_path=file_path, con=con, table_name=table_name, accept_additional_col=True)
@@ -300,6 +316,31 @@ def main():
         
         # Summarize DQ results
         CheckResult.summary(LOGGER)
+
+        # Subsume the submission files into the duckdb file, now that every check has run.
+        # This has to come after the checks: the views are live handles on the parquet, so a
+        # table consumed early would pull the file out from under a check that still needs it.
+        # Leaving materialize 'off' and running `python -m src.materialize` afterwards does the
+        # same thing as a separate stage, with the DQ results available to read in between.
+        if materialize_mode != 'off':
+            consume = materialize_mode == 'consume'
+            if consume and len(CheckResult.dq_fail) > 0 and not consume_with_dq_failures:
+                LOGGER.warning(
+                    f"{len(CheckResult.dq_fail)} DQ failure(s) in this run; materializing the submission "
+                    "files but keeping them on disk. Review logging.dq, then consume them with "
+                    "`python -m src.materialize --consume --force` if they are expected."
+                )
+                consume = False
+            elif consume and len(CheckResult.dq_fail) > 0:
+                LOGGER.warning(f"Consuming submission files despite {len(CheckResult.dq_fail)} DQ failure(s) (consume_with_dq_failures).")
+            LOGGER.info(f"Materializing pointer views into the duckdb file (materialize={materialize_mode}).")
+            materialize_pointer_views(
+                con=con,
+                data_model=data_model,
+                consume=consume,
+                sources=get_pointer_sources(con, run_id=run_id) if consume else None,
+            )
+
         # Exit with code 1 if there is any DQ failure        
         if len(CheckResult.dq_fail) > 0:
             exit(1)

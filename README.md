@@ -181,6 +181,18 @@ Ignoring submission_files setting(s) this version does not support: ['access_mod
 
 This catches a misspelled setting, and a config written for a newer build than the one being run -- both of which otherwise load, appear in the config dump, and are silently ignored.
 
+### What the DuckDB file records about the run
+
+`logging.run.config` inside the DuckDB file holds a copy of the run config, so whoever reads the DQ results can see what they were produced against. The DuckDB file is the deliverable, so that copy is **redacted before it is written**: only an allowlist of settings is persisted (see `PERSISTED_CONFIG_KEYS` in `src/config.py`), and everything else is replaced with `<redacted>`.
+
+| kept | masked |
+|---|---|
+| `data-models`: `mode`, `name`, `version`; the file name (not the directory) of a local data model; the data model service URL without credentials or query string | every filesystem path: `submission_files.dir`, `duckdb.path`, `core.log_path` |
+| `submission_files`: `file_format`, `multiple_file_per_table`, `access_mode`, `materialize`, `consume_with_dq_failures` | any key this version does not read, and any section it does not know, whole |
+| `duckdb`: `skip_load`, `copy_options`, `memory_limit`; `core`: `log_level`, `run_id` | |
+
+It is an allowlist rather than a denylist because the config has a fixed shape, so the safe keys can be named outright, and a setting this code has never heard of (such as a connection string a site keeps in the same file) is masked instead of guessed at. The key name survives, so a reader can tell a setting was present without learning its value. The full config is still printed to the console and the log file (`core.log_path`), which stay on the host.
+
 ## Implemented Checks
 
 The following data quality checks are currently supported:

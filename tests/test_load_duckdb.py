@@ -269,3 +269,38 @@ def test_remove_submission_source_handles_a_part_directory(tmp_path):
     remove_submission_source(str(part_dir))
 
     assert not os.path.exists(part_dir)
+
+
+# --- what logging.run.config holds in the shipped file --------------------------------------
+
+def test_logging_run_config_is_redacted_before_it_is_persisted():
+    """The duckdb file leaves the site, so the raw config must never be written into it."""
+    from src.load_duckdb import init_duckdb_logging_schema
+    config = {
+        'data-models': {'mode': 'json', 'name': 'pedsnet', 'version': '5.7.0',
+                        'file_path': '/srv/secret-host/models/pedsnet_v57_data_model.json'},
+        'submission_files': {'dir': '/mnt/phi-export/site', 'file_format': 'csv', 'access_mode': 'copy'},
+        'duckdb': {'path': '/result/site.duckdb', 'skip_load': ['note']},
+        'core': {'log_level': 'INFO', 'log_path': '/var/log/site.log'},
+        'warehouse': {'password': 'hunter2'},
+    }
+    with duckdb.connect() as connection:
+        init_duckdb_logging_schema(connection, 'run-redact', config)
+        run_id, persisted = connection.execute(
+            "SELECT run_id, config FROM logging.run WHERE run_id = 'run-redact'"
+        ).fetchone()
+
+    assert run_id == 'run-redact'
+    for fragment in ('secret-host', 'phi-export', '/result', '/var/log', 'hunter2', 'password'):
+        assert fragment not in persisted, fragment
+    for kept in ("'name': 'pedsnet'", "'version': '5.7.0'", "'access_mode': 'copy'",
+                 "'skip_load': ['note']", "'file_path': 'pedsnet_v57_data_model.json'"):
+        assert kept in persisted, kept
+
+
+def test_logging_run_handles_a_run_id_with_a_quote():
+    """run_id is bound as a parameter, so a quote in it cannot break or alter the INSERT."""
+    from src.load_duckdb import init_duckdb_logging_schema
+    with duckdb.connect() as connection:
+        init_duckdb_logging_schema(connection, "it's", {})
+        assert connection.execute("SELECT count(*) FROM logging.run WHERE run_id = 'it''s'").fetchone()[0] == 1

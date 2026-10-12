@@ -2,7 +2,7 @@ from typing import List
 import os
 import shutil
 from src.util import get_csv_header, get_table_count, get_parquet_header, table_exists
-from src.config import CONFIG, LOGGER
+from src.config import CONFIG, LOGGER, redact_config_for_persistence
 from duckdb import DuckDBPyConnection
 import duckdb
 from src.data_model import DataModel
@@ -371,8 +371,12 @@ def init_duckdb_logging_schema(con: DuckDBPyConnection, run_id: str, run_config:
         source_path VARCHAR
     );
     """)
-    # insert a new run
-    con.execute(f"""INSERT INTO {logging_schema}.run (run_id, start_time, config) VALUES ('{run_id}', current_localtimestamp(), ?);""", (str(run_config),))
+    # insert a new run. The duckdb file is what gets shipped, so only the allowlisted part of
+    # the config is written into it: paths and anything credential-like stay on the host.
+    con.execute(
+        f"""INSERT INTO {logging_schema}.run (run_id, start_time, config) VALUES (?, current_localtimestamp(), ?);""",
+        (run_id, str(redact_config_for_persistence(run_config))),
+    )
     return con
 
 def create_duckdb_tables(data_model: DataModel, con: DuckDBPyConnection, skip_tables: List = [], recreate: bool = False):

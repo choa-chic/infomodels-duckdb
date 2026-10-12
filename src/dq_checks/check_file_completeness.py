@@ -5,6 +5,25 @@ from src.dq_checks.check_result import CheckResult
 from src.config import LOGGER
 from src.constants import OPTIONAL_TABLES
 
+def _file_extension_for(file_format: str) -> str:
+    """Map a file_format to the extension a single-file-per-table submission uses."""
+    if file_format == 'csv':
+        return '.csv'
+    if file_format == 'parquet':
+        return '.parquet'
+    raise ValueError(f"Unsupported file_format: {file_format}. Supported types are 'csv' and 'parquet'.")
+
+
+def _submission_name_for_table(table_name: str, file_format: str, multiple_file_per_table: bool) -> str:
+    """
+    The name a table has on disk: '{table}.csv' / '{table}.parquet' when each table is one
+    file, or the bare directory name when a table is a folder of parts.
+    """
+    if multiple_file_per_table:
+        return table_name
+    return table_name + _file_extension_for(file_format)
+
+
 def _get_table_names_from_files(
         file_dir: str,
         file_format: str,
@@ -21,12 +40,7 @@ def _get_table_names_from_files(
     """
     table_names = set()
     if not multiple_file_per_table:
-        if file_format == 'csv':
-            file_extension = '.csv'
-        elif file_format == 'parquet':
-            file_extension = '.parquet'
-        else:
-            raise ValueError(f"Unsupported file_format: {file_format}. Supported types are 'csv' and 'parquet'.")
+        file_extension = _file_extension_for(file_format)
         table_names = {os.path.splitext(f)[0] for f in os.listdir(file_dir) if f.endswith(file_extension)}
     else:
         dir_names_on_dir = [d for d in os.listdir(file_dir) if os.path.isdir(os.path.join(file_dir, d))]
@@ -92,7 +106,11 @@ def check_extra_submission_file(
         duckdb_conn = None
     ) -> CheckResult:
     """
-    Check if the directory contains extra CSV files for each CDM table.
+    Check if the directory contains submission files for tables the data model does not define.
+
+    Such a file is never loaded or submitted, so it usually means a misnamed table or a
+    config pointed at the wrong directory. Reported as WARN rather than FAIL, with the names
+    the files have on disk ('{table}.csv', or the folder name when multiple_file_per_table).
 
     Parameters:
         file_dir (str): Path to the directory containing submission files.
@@ -114,18 +132,23 @@ def check_extra_submission_file(
         )
         result.log(LOGGER, duckdb_conn=duckdb_conn)
         return(result)    
-    filenames_from_tables = _get_table_names_from_files(
+    table_names_from_files = _get_table_names_from_files(
         file_dir = file_dir,
         file_format = file_format,
         multiple_file_per_table = multiple_file_per_table
     )
-    extra_files = set(filenames_from_tables) - set(filenames_from_tables)
-    if len(extra_files) > 0:
+    # on disk but not in the data model; the mirror image of check_missing_submission_file
+    extra_tables = set(table_names_from_files) - set(cdm_tables_expected)
+    if len(extra_tables) > 0:
+        extra_files = tuple(sorted(
+            _submission_name_for_table(table, file_format, multiple_file_per_table)
+            for table in extra_tables
+        ))
         result = CheckResult(
             check_type = check_type,
             status = 'WARN',
-            file_name = tuple(extra_files),
-            troubleshooting_message = "Extra file(s) in directory. These files will not be loaded and submitted. Pleased make sure there's no config issue."
+            file_name = extra_files,
+            troubleshooting_message = "Extra file(s) in submission directory. These files will not be loaded and submitted. Please make sure there's no config issue."
         )
     else:
         result = CheckResult(

@@ -1,7 +1,9 @@
 import yaml
 import logging
 import os
+import posixpath
 import sys
+from urllib.parse import urlsplit, urlunsplit
 
 # INFOMODELS_CONFIG lets a run (or the test suite) point at a config outside the cwd
 CONFIG_FILE = os.environ.get('INFOMODELS_CONFIG', 'config.yml')
@@ -22,6 +24,98 @@ KNOWN_SUBMISSION_FILE_SETTINGS = frozenset({
     'materialize',
     'consume_with_dq_failures',
 })
+
+
+# What a run writes into logging.run.config inside the duckdb file. That file is the
+# deliverable: it leaves the site, so anything persisted into it is disclosed to whoever
+# receives it. The config.yml it comes from is written by site staff and is not under this
+# code's control -- it can hold paths that describe the host, and nothing stops a site from
+# keeping a connection string or token next to the settings this tool reads.
+#
+# This is an ALLOWLIST, not a denylist: the config has a fixed shape (four sections, each
+# with a known set of keys), so the safe keys can be named outright, and a key this code has
+# never heard of is masked rather than guessed at. A denylist would need to anticipate every
+# spelling of "password", and would pass a new secret-bearing key straight through.
+#
+# Kept: what someone reading the DQ results needs to interpret them -- which data model and
+# version the checks ran against, how the submission was read (format, layout, access mode,
+# what happened to the files afterwards), which tables were deliberately not loaded, and the
+# duckdb options that shaped the load. Masked: every filesystem path, the log file, and
+# anything not in this list. The masked value keeps the key name, so a reader can see a
+# setting was present without seeing what it held.
+PERSISTED_CONFIG_KEYS = {
+    'data-models': frozenset({'mode', 'name', 'version', 'service_base_url', 'file_path'}),
+    'submission_files': frozenset({
+        'file_format', 'multiple_file_per_table', 'access_mode', 'materialize',
+        'consume_with_dq_failures',
+    }),
+    'duckdb': frozenset({'skip_load', 'copy_options', 'memory_limit'}),
+    'core': frozenset({'log_level', 'run_id'}),
+}
+# Allowlisted keys whose value is a local path: only the final component is kept. The
+# basename of a data model file (pedsnet_v57_data_model.json) is provenance; the directory
+# that held it is host layout.
+PERSISTED_CONFIG_BASENAME_KEYS = frozenset({('data-models', 'file_path')})
+# Allowlisted keys whose value is a URL: userinfo, query string and fragment are dropped, so
+# a SAS token, signature or embedded credential never reaches the file. Scheme, host and
+# path stay, which is what identifies the data model service.
+PERSISTED_CONFIG_URL_KEYS = frozenset({('data-models', 'service_base_url')})
+REDACTED = '<redacted>'
+
+
+def _scrub_url(value):
+    if not isinstance(value, str):
+        return REDACTED
+    parts = urlsplit(value)
+    if not parts.scheme or not parts.netloc:
+        # not something urlsplit can take apart safely, so do not pretend it is clean
+        return REDACTED
+    host = parts.hostname or ''
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, '', ''))
+
+
+def _scrub_path(value):
+    if not isinstance(value, str):
+        return REDACTED
+    # posixpath on a normalised separator handles both Windows and POSIX paths the same way
+    basename = posixpath.basename(value.replace('\\', '/').rstrip('/'))
+    return basename if basename else REDACTED
+
+
+def redact_config_for_persistence(run_config) -> dict:
+    """
+    Return the subset of the run config that is safe to write into the shipped duckdb file.
+
+    See PERSISTED_CONFIG_KEYS for what is kept and why. The result keeps the shape of the
+    input -- the same sections and keys appear -- but every value that is not allowlisted is
+    replaced with REDACTED, so a reader can tell a setting was configured without learning
+    what it was set to. Sections this code does not know are masked whole, without
+    descending into them, since their key names are not known to be harmless either.
+
+    The input is not modified.
+    """
+    if not isinstance(run_config, dict):
+        return {}
+    redacted = {}
+    for section, settings in run_config.items():
+        allowed = PERSISTED_CONFIG_KEYS.get(section)
+        if allowed is None or not isinstance(settings, dict):
+            redacted[section] = REDACTED
+            continue
+        kept = {}
+        for key, value in settings.items():
+            if key not in allowed:
+                kept[key] = REDACTED
+            elif (section, key) in PERSISTED_CONFIG_URL_KEYS:
+                kept[key] = _scrub_url(value)
+            elif (section, key) in PERSISTED_CONFIG_BASENAME_KEYS:
+                kept[key] = _scrub_path(value)
+            else:
+                kept[key] = value
+        redacted[section] = kept
+    return redacted
 
 
 def get_logger(name='main') -> logging.Logger:
